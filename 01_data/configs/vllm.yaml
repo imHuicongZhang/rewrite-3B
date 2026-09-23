@@ -1,0 +1,80 @@
+# configs/vllm.yaml -- engine + sampling, COPIED FROM THE 1.5B PIPELINE.
+# Nothing here is tunable.  Every value was read out of 07_rewrite/09_Distill or their logs.
+# Changing any of it changes generation behaviour and destroys comparability with the 1.5B run.
+
+model:
+  # local dir; repo Qwen/Qwen2.5-7B-Instruct, bf16, Qwen2ForCausalLM.
+  # The real guard is the prompt-overhead gate (150/185/72/66/73/83): if the chat template
+  # ever changes those integers move and preflight fails before any GPU time is spent.
+  path_key: qwen
+
+llama2_tokenizer:
+  # Used ONLY to count output tokens, as len(tok(text, add_special_tokens=False).input_ids).
+  path_key: llama2
+  expected_vocab_size: 32000
+
+# Exactly the five kwargs the 1.5B run passed to LLM().  Adding a key here is a config error,
+# not a feature -- kys3b.config rejects anything outside this set.
+#   source: 07_rewrite/rewrite_worker.py:240-241 ; 09_Distill/rewrite_worker.py
+engine:
+  tensor_parallel_size: 1          # MUST stay 1.  Data parallelism is N independent
+                                   # single-GPU processes; vLLM's data_parallel_size was
+                                   # never used at 1.5B.
+  dtype: bfloat16
+  gpu_memory_utilization: 0.85     # what the sbatch actually passed for BOTH passes.  The
+                                   # 0.90 in the 1.5B argparse default/READMEs never ran.
+  max_model_len: 32768
+
+# vLLM defaults the 1.5B run silently relied on.  RECORDED FOR THE READER, NEVER PASSED.
+inherited_defaults_do_not_pass:
+  max_num_batched_tokens: 16384
+  enable_prefix_caching: true
+  enable_chunked_prefill: true
+  enforce_eager: false
+  seed: 0
+  quantization: null
+  data_parallel_size: 1
+  pipeline_parallel_size: 1
+  swap_space: 4
+  kv_cache_dtype: auto
+
+# source: 07_rewrite/rewrite_worker.py:294-296
+#   max_new = min(max_tokens, max_model_len - n_in)
+#   SamplingParams(temperature=0, top_p=1.0, max_tokens=max(1, max_new))
+# A LIST of SamplingParams is built, one per kept document.
+# NOT SET ANYWHERE IN THE 1.5B SOURCE, and must not be added: top_k, min_tokens, stop,
+# stop_token_ids, seed, repetition_penalty, presence_penalty, frequency_penalty, n,
+# skip_special_tokens, include_stop_str_in_output, logprobs, best_of.
+sampling:
+  temperature: 0
+  top_p: 1.0
+  max_tokens: 4096
+
+# Chat template application, source: rewrite_worker.py:285-287.
+# A single user message; NO system message is authored -- Qwen's own template injects
+# "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+chat:
+  add_generation_prompt: true
+  tokenize: false
+  role: user
+
+# Per-pass status=0 drop threshold on the TEMPLATED input length, in Qwen tokens.
+#   pass1  : fixed 30720                     (07_rewrite/sbatch_template.sh --input-drop)
+#   distill: derived max_model_len-max_tokens (09_Distill: every kept doc gets the full
+#            4096-token output budget)
+input_drop:
+  p1: 30720
+  distill: 28672
+
+# Prompt-overhead gates: templated length of an EMPTY document, measured with the production
+# Qwen tokenizer.  Verified 2026-09-23 against the copied prompts: all six match.
+prompt_overheads:
+  p1_wiki: 150
+  p2_distill: 185
+  wrap_easy: 72
+  wrap_hard: 66
+  wrap_wiki: 73
+  wrap_qa: 83
+
+# Qualitative monitor (1.5B behaviour): sample this many docs per worker interval.
+monitor_every: 10000

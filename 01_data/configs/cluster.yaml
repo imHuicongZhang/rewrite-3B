@@ -1,0 +1,41 @@
+# configs/cluster.yaml -- Skipjack.  The 1.5B directives (partition nvl, qos h200_4,
+# --exclude=n02,n03,c001) do not exist here; see plan.md section 13.2 / 14.
+
+cluster: skipjack
+
+gpu:
+  partitions: "h100,h200"        # 32x4 H100 + 6x4 H200 = 152 GPUs installed, shared
+  # Generic gres type so one array can land on EITHER partition.  `--gres=gpu:h100:1`
+  # would never schedule on h200.  Validated with sbatch --test-only.
+  gres: "gpu:1"
+  cpus_per_task: 16              # DefCpuPerGPU=30; 16 -> 187.5G at DefMemPerCPU=12000
+  time: "3-00:00:00"             # partition maximum
+  queues:
+    # jhu2 ALLOWS UP TO 32 concurrent GPUs for this user.  It does NOT guarantee them:
+    # actual availability depends on queue contention and scheduler allocation.
+    primary:
+      account: bvandur1_blabscify
+      qos: jhu2
+      array: "0-31%32"
+      requeue: false
+    # scavenger adds PREEMPTIBLE capacity with no stated ceiling and no promise.
+    opportunistic:
+      account: bvandur1
+      qos: scavenger
+      array: "0-63%64"
+      requeue: true
+
+cpu:
+  partition: med                 # 74 nodes, 108 CPU/node, MaxMemPerCPU=4000, QoS cpu_qos
+  qos: cpu_qos
+  account: bvandur1_blabscify
+  cpus_per_task: 96
+  mem: "360G"
+  time: "12:00:00"
+
+env:
+  # An env with vLLM does not yet exist on Skipjack -- scripts/00_setup_env.sh creates it.
+  # Everything except the rewriting worker runs under the `data` env below.
+  python_data:  /weka/scratch/jhu/bvandur1/zhuicon1/envs/data/bin/python
+  python_vllm:  /weka/projects/bvandur1/zhuicon1/rewrite-3b/envs/vllm/bin/python
+  offline: true                  # HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE on compute nodes

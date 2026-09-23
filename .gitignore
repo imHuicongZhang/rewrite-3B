@@ -1,0 +1,14 @@
+# The manuscript is under double-blind review -- kept local, not committed.
+00_paper/
+
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# never commit data or generated artefacts
+*.parquet
+*.npy
+*.bin
+logs/

@@ -1,0 +1,115 @@
+# configs/budgets.yaml -- every token budget in the 3B scale-up, with its 1.5B ancestor.
+#
+# All budgets are in LLAMA-2 TRAIN TOKENS, i.e. (tokens-llama2 + 1) summed over documents
+# (one leading BOS per document).  This is the 1.5B convention; see plan.md section 2.2.
+#
+# Nothing here may be changed without changing plan.md first.  `bin/preflight.py` asserts
+# the invariants at the bottom of this file.
+
+seed: 42                    # np.random.SeedSequence(42).spawn(8); child map in select.py
+lambda_da: 0.5              # DISAGREEMENT-AWARE weight -- the ONLY value built (Decision 12)
+kappa: 2                    # REWIRE oversampling, applied to B_s ONLY, never to the base
+
+pool:
+  n_docs: 99949162          # published KYS-DCLM-Refinedweb-100M-Scored row count
+  n_shards: 200
+  rows_full: 500000
+  rows_last: 449162
+  topic_n: 24
+  # Decision 1: the ONLY exclusion is the validation holdout.  The 5M scorer/topic analysis
+  # sample is NOT removed -- ~4,998,853 of its documents are present in the published pool and
+  # the 1.5B pipeline did not remove them either.  See plan.md section 20 D-1.
+  val_size: 50000
+
+budgets:
+  # ---- shared fixed component, identical in all six settings -------------------------
+  shared_base:        10_000_000_000     # 1.5B ancestor: 5e9
+  # ---- QUALITY-BASE second half, raw, never rewritten --------------------------------
+  quality_base:       10_000_000_000     # 1.5B ancestor: 5e9
+  # ---- rewritten-output budget B -----------------------------------------------------
+  rewritten_target:   10_000_000_000     # 1.5B ancestor: 5e9
+  # ---- source budget B_s = 2*B -------------------------------------------------------
+  source:             20_000_000_000     # 1.5B ancestor: 1e10
+  # ---- REWIRE pre-rewrite pool = kappa * B_s -----------------------------------------
+  rewire_source:      40_000_000_000     # 1.5B ancestor: 2e10 (select_10b.py:51)
+  # ---- DISAGREEMENT-AWARE per-scorer candidate budget (Option C = B_s) ---------------
+  # 1.5B used "top 10% by tokens of the residual pool" ~= 9.03e9 ~= 0.90*B_s.  At 3B the
+  # literal 10% rule yields ~8.53e9 per scorer -> U_tau ~15.8e9 < 20e9, INFEASIBLE.
+  # Option C (per-scorer budget = B_s) is the locked choice; plan.md section 20 D-2.
+  da_per_scorer:      20_000_000_000
+
+disagreement:
+  q_floor_pct: 30.0         # tau_q = 30th percentile of q over U      (1.5B: identical)
+  v_cap_pct:   90.0         # tau_v = 90th percentile of v over U      (1.5B: identical)
+
+# ---- training handoff: MATCHED cumulative token horizons (Decision 5 / plan.md 18.3) ---
+# Horizons are TOKEN horizons, never corpus_size * n_epochs.  A corpus slightly under
+# epoch_tokens is simply re-read slightly more often.
+training:
+  epoch_tokens: 20_000_000_000
+  horizons: [20_000_000_000, 40_000_000_000, 60_000_000_000]
+  seeds: [42, 43, 44]
+
+# ---- source-shard geometry for the rewriting stage (Decision 8) ------------------------
+sharding:
+  rows_per_shard: 10000
+  claim_stale_seconds: 1800     # 30 min without a heartbeat -> reclaimable
+
+# ---- the six settings ------------------------------------------------------------------
+# rewrite: null           -> raw, never sent to a GPU
+# pass1:   'grounded'     -> prompts/wikipedia_style_rephrasing_grounded.md
+#          'wrap'         -> one of prompts/wrap/{easy,hard,wiki,qa}.txt per document
+# assemble:
+#   'pass1_then_key'      -> all status==2 pass-1, then distill top-up ordered by `sort_key`
+#   'pass1_then_random'   -> all status==2 pass-1, then distill top-up by default_rng(42),
+#                            NO quality signal (the 1.5B wrap arm, deliberately)
+#   'per_topic'           -> per-topic quota, pass-1 first then distill by `sort_key`
+#                            WITHIN topic, no cross-topic backfill, no padding (policy A)
+#   'post_rewrite_fasttext' -> REWIRE: pool BOTH passes, fastText-score the rewritten text,
+#                            global DESC, fill to B
+settings:
+  quality-base:
+    select: fasttext_prefix
+    source_budget: null               # uses budgets.quality_base, raw
+    rewrite: null
+    assemble: null
+  quality-first:
+    select: fasttext_prefix
+    source_budget: source
+    rewrite: {pass1: grounded, distill: true}
+    assemble: pass1_then_key
+    sort_key: fasttext                # fasttext-ranking-v2 DESC
+  wrap-inspired:
+    select: uniform
+    rng_child: 2
+    source_budget: source
+    rewrite: {pass1: wrap, distill: true}
+    assemble: pass1_then_random
+    sort_key: null
+  rewire-inspired:
+    select: uniform
+    rng_child: 3
+    source_budget: rewire_source      # kappa * B_s = 40e9
+    rewrite: {pass1: grounded, distill: true}
+    assemble: post_rewrite_fasttext
+    sort_key: rewritten_fasttext
+  diversity-oriented:
+    select: topic_stratified
+    source_budget: source
+    select_key: q                     # consensus quality WITHIN topic  (paper Eq. 6)
+    rewrite: {pass1: grounded, distill: true}
+    assemble: per_topic
+    sort_key: fasttext                # 1.5B assembly used fastText within topic (D-6)
+  disagreement-aware:
+    select: disagreement
+    source_budget: source
+    rewrite: {pass1: grounded, distill: true}
+    assemble: pass1_then_key
+    sort_key: u                       # u = q + lambda*sqrt(v) DESC
+
+# ---- invariants asserted by bin/preflight.py -------------------------------------------
+invariants:
+  source_eq_2x_rewritten: true        # budgets.source == 2 * budgets.rewritten_target
+  rewire_eq_kappa_x_source: true      # budgets.rewire_source == kappa * budgets.source
+  da_per_scorer_eq_source: true       # Option C
+  base_eq_quality_base: true          # shared_base == quality_base (both 10e9)

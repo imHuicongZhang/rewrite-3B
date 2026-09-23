@@ -1,0 +1,6 @@
+{
+  "easy": "Rewrite the following passage in simple, plain language that a young child could understand. Keep the key information; do not add new facts. Output ONLY the rewritten passage, with no preamble or commentary.\n\nPassage:\n",
+  "hard": "Rewrite the following passage using precise, formal, scholarly language. Preserve all information and add no new facts. Output ONLY the rewritten passage, with no preamble or commentary.\n\nPassage:\n",
+  "wiki": "Rewrite the following passage in the clear, neutral, factual style of a high-quality encyclopedia article. Preserve all information and add no new facts. Output ONLY the rewritten passage, with no preamble or commentary.\n\nPassage:\n",
+  "qa": "Convert the following passage into a series of clear question-and-answer pairs that cover its key information. Add no new facts. Format each as 'Q: ...' and 'A: ...'. Output ONLY the question-answer pairs, with no preamble or commentary.\n\nPassage:\n"
+}

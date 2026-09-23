@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+# generated artefacts -- reports are regenerated from the pipeline, never hand-edited
+reports/*.json
+reports/*.md
+!reports/.gitkeep
+# never commit data
+*.parquet
+*.npy
+*.bin
+logs/

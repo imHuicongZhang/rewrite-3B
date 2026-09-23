@@ -1,0 +1,35 @@
+# configs/paths.yaml -- Decision 7: large data lives on /weka/projects/bvandur1 (117 TB free).
+# The scratch quota (/weka/scratch/jhu/bvandur1) has ~137 GB free and cannot hold the pool.
+
+roots:
+  code:    /weka/scratch/jhu/bvandur1/zhuicon1/projects/rewrite-3B/01_data
+  data:    /weka/projects/bvandur1/zhuicon1/rewrite-3b
+  pool:    /weka/projects/bvandur1/zhuicon1/rewrite-3b/00_pool
+  dataset: /weka/projects/bvandur1/zhuicon1/rewrite-3b/dataset
+  cache:   /weka/projects/bvandur1/zhuicon1/rewrite-3b/.cache
+
+# Symlinks created by scripts/01_make_symlinks.sh AFTER the targets exist, so the paths the
+# project was originally specified with still resolve.
+symlinks:
+  /weka/scratch/jhu/bvandur1/zhuicon1/datasets/dclm-refinedweb-100m-sample:  pool
+  /weka/scratch/jhu/bvandur1/zhuicon1/datasets/rewrite-3b-llama-60b-tokens:  dataset
+
+stages:                      # relative to roots.dataset
+  selection:  01_selection
+  sources:    02_sources
+  rewritten:  03_rewritten
+  filtered:   04_filtered
+  final:      05_final
+  logs:       logs
+  reports:    reports
+
+hf:
+  pool_repo:     blab-jhu/KYS-DCLM-Refinedweb-100M-Scored
+  pool_revision: main         # pinned at download time into the stage-00 manifest
+  shard_glob:    merged_clean_*.parquet
+
+models:
+  # The exact local copies that produced the 1.5B corpus.
+  qwen:     /weka/scratch/jhu/bvandur1/zhuicon1/models/Qwen2.5-7B-Instruct
+  llama2:   /weka/scratch/jhu/bvandur1/zhuicon1/tokenizers/llama2-unsloth-tokenizer
+  fasttext: /weka/scratch/jhu/bvandur1/zhuicon1/models/5m/external/fasttext_oh_eli5.bin
