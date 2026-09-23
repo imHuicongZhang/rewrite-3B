@@ -683,7 +683,7 @@ Every item is either resolved with an action, or needs no action. Nothing is sil
 - **99,949,162 rows**, 500,000 per shard, last shard 449,162. Row count = 100,000,000 − 50,838
   (documents overlapping the ModernBERT scorer's training set — and *only* those; see §20 D-1).
 
-**Columns — all 14, and every field the six strategies need is present:**
+**Columns — all 13, and every field the six strategies need is present** (verified against the downloaded pool on 2026-09-23; an earlier revision of this plan said 14, which was a miscount of the dataset card's own table):
 
 | column | type | needed by |
 |---|---|---|
