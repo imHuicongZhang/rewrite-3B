@@ -279,24 +279,44 @@ class ClaimDir:
         finally:
             self._release_guard(guard)
 
-    def heartbeat(self, shard: int) -> None:
-        """Refresh our claim's heartbeat.  A no-op if we are not the owner."""
+    def owns(self, shard: int) -> bool:
+        """True iff the claim on `shard` currently names THIS process.
+
+        Uses the same identity rule as everything else (host + pid).  An absent or unverifiable
+        claim is NOT ours -- the safe direction, because the caller uses this to decide whether it
+        may commit output.
+        """
+        meta = self._read(self._path(shard))
+        return meta is not None and self._is_mine(meta)
+
+    def heartbeat(self, shard: int) -> bool:
+        """Refresh our claim's heartbeat.
+
+        Returns True only when the claim was ACTUALLY rewritten.  Returns False when this process
+        is not (or is no longer) the owner -- a legitimate no-op, not a failure.  RAISES on a
+        genuine filesystem failure, so a monitor cannot mistake an unwritten claim for a live one:
+        swallowing the error here is what would let a worker believe its claim is fresh while it
+        silently ages into reclaimable.
+        """
         p = self._path(shard)
         meta = self._read(p)
-        if meta is not None and not self._is_mine(meta):
-            return  # not ours: never touch another worker's claim
-        meta = meta if meta is not None else self.identity()
+        if meta is None or not self._is_mine(meta):
+            # absent, corrupt, or someone else's: never touch another worker's claim, and never
+            # adopt a claim we cannot verify
+            return False
         meta = {**meta, **self.identity(), "heartbeat": time.time()}
         # per-process temp name so two workers can never collide on the same scratch path
         tmp = self.dir / f"shard_{shard:05d}.claim.hb.{os.getpid()}"
         try:
             tmp.write_text(json.dumps(meta))
             os.replace(tmp, p)
-        except Exception:
+        except BaseException:
             try:
                 tmp.unlink()
             except FileNotFoundError:
                 pass
+            raise
+        return True
 
     def release(self, shard: int) -> None:
         """Drop our claim.  Only removes it if we still own it.
@@ -407,25 +427,38 @@ class Heartbeat:
         self.interval = float(interval)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self.beats = 0
-        self.errors = 0
+        self.beats = 0          # refreshes that actually rewrote the claim
+        self.lost = 0           # refreshes skipped because we are no longer the owner
+        self.errors = 0         # refreshes that raised
         self.last_error: BaseException | None = None
 
     def _loop(self) -> None:
         # Event.wait doubles as the sleep AND the stop signal, so exit is immediate.
         while not self._stop.wait(self.interval):
             try:
-                self.claims.heartbeat(self.shard)
-                self.beats += 1
+                if self.claims.heartbeat(self.shard):
+                    self.beats += 1
+                else:
+                    # ownership is gone; keep looping so `lost` keeps rising and the shard's
+                    # ownership check refuses to commit, but stop pretending we are alive
+                    self.lost += 1
             except BaseException as e:  # noqa: BLE001 -- a monitor thread must not die silently
                 self.errors += 1
                 self.last_error = e
+
+    @property
+    def healthy(self) -> bool:
+        """No failed refresh and no lost ownership since the section began."""
+        return self.errors == 0 and self.lost == 0
 
     def __enter__(self) -> "Heartbeat":
         if self.interval <= 0:
             return self  # disabled
         try:
-            self.claims.heartbeat(self.shard)  # refresh immediately, then periodically
+            if self.claims.heartbeat(self.shard):  # refresh now, then periodically
+                self.beats += 1
+            else:
+                self.lost += 1
         except BaseException as e:  # noqa: BLE001 -- entering must not fail the shard
             self.errors += 1
             self.last_error = e
@@ -445,8 +478,13 @@ class Heartbeat:
                 log(f"  WARNING: heartbeat thread for shard {self.shard:05d} did not stop")
         if self.errors:
             log(
-                f"  WARNING: {self.errors} heartbeat error(s) on shard {self.shard:05d}; "
-                f"last: {self.last_error!r}"
+                f"  WARNING: {self.errors} heartbeat FAILURE(S) on shard {self.shard:05d} "
+                f"({self.beats} succeeded); last: {self.last_error!r}"
+            )
+        if self.lost:
+            log(
+                f"  WARNING: lost ownership of shard {self.shard:05d} during processing "
+                f"({self.lost} skipped refresh(es), {self.beats} succeeded)"
             )
         return False  # never suppress the original exception
 

@@ -12,6 +12,8 @@ detail is preserved:
            2 = finish_reason == 'stop'     (complete)
   * rewritten_tokens counted with the LLAMA-2 tokenizer, add_special_tokens=False
   * atomic .tmp + os.replace per shard; an existing output shard is skipped (resume)
+  * the claim is re-verified immediately before the commit, so a shard whose ownership was lost
+    mid-generation aborts rather than racing the new owner's write
   * distill reads the RAW SOURCE shards, never pass-1 output (asserted)
   * the wrap styled pass records `wrap_style`; other passes do not
 
@@ -297,6 +299,7 @@ def run(args) -> int:
             with Heartbeat(claims, shard, hb_interval):
                 _process_shard(
                     shard=shard, cfg=cfg, index=index, src_dir=src_dir, out_dir=out_dir,
+                    claims=claims,
                     llm=llm, qtok=qtok, ltok=ltok, mode=mode, template=template, wp=wp,
                     smp=smp, drop=drop, chat=chat, max_model_len=max_model_len,
                     sampling_cls=SamplingParams,
@@ -313,7 +316,7 @@ def run(args) -> int:
 
 
 def _process_shard(
-    *, shard, cfg, index, src_dir, out_dir, llm, qtok, ltok, mode, template, wp, smp, drop,
+    *, shard, cfg, index, src_dir, out_dir, claims, llm, qtok, ltok, mode, template, wp, smp, drop,
     chat, max_model_len, sampling_cls, smoke_rows, prog, prog_dir, wkey, wid, t0, setting,
     pass_name, monitor_file, monitor_every, since,
 ):
@@ -386,6 +389,17 @@ def _process_shard(
     }
     if mode == "wrap":
         cols["wrap_style"] = pa.array(styles, type=pa.large_string())
+
+    # Ownership gate, immediately before the atomic commit.  If heartbeat refreshes failed while
+    # this shard was generating, another worker may legitimately have reclaimed it and may already
+    # be writing the same output.  Committing anyway would race two writers on one path.  Abort
+    # the shard instead: the new owner's work stands, and `release()` will not touch their claim
+    # because it verifies ownership too.
+    check(
+        claims.owns(shard),
+        f"shard {shard:05d}: this process no longer owns the claim -- refusing to write output. "
+        "Another worker reclaimed it (heartbeat refreshes must have failed); its result stands.",
+    )
     atomic_write_table(pa.table(cols), shard_path(out_dir, shard))
 
     prog["shards_completed"] += 1

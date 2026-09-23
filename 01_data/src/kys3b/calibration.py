@@ -126,3 +126,47 @@ def project_yield(cfg, per_pass_r: dict[str, float], source_budget: int) -> dict
     out["headroom_pct"] = 100.0 * (out["projected_total_tokens"] / cfg.B - 1.0)
     out["meets_target"] = out["projected_total_tokens"] >= cfg.B
     return out
+
+
+# --------------------------------------------------------------------------- fail-closed verify
+def verify_pilot(src_dir, out_dir, expected: list[int], index: dict) -> list[str]:
+    """Return a list of problems with a pilot pass.  Empty list means complete and aligned.
+
+    Collects every problem instead of aborting on the first, so one run tells you exactly what is
+    missing.  A pilot is a GATE before thousands of GPU-hours: it must fail closed, so anything
+    short of "every expected shard present, full-row and doc_id-aligned" is a problem.
+    """
+    problems: list[str] = []
+    if not expected:
+        return ["no expected pilot shards (empty shard set)"]
+    for k in expected:
+        sp = shard_path(src_dir, k)
+        op = shard_path(out_dir, k)
+        if not sp.exists():
+            problems.append(f"shard {k:05d}: source shard missing ({sp})")
+            continue
+        if not op.exists():
+            problems.append(f"shard {k:05d}: output MISSING")
+            continue
+        want_rows = int(index["shards"][k]["rows"])
+        try:
+            src = pq.read_table(sp, columns=["doc_id"], use_threads=False)
+            out = pq.read_table(op, columns=["doc_id"], use_threads=False)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"shard {k:05d}: unreadable ({e!r})")
+            continue
+        if out.num_rows != want_rows:
+            problems.append(
+                f"shard {k:05d}: PARTIAL -- {out.num_rows} output rows != {want_rows} source rows"
+            )
+            continue
+        if src.num_rows != want_rows:
+            problems.append(
+                f"shard {k:05d}: source has {src.num_rows} rows != index {want_rows}"
+            )
+            continue
+        s_ids = src.column("doc_id").to_numpy(zero_copy_only=False)
+        o_ids = out.column("doc_id").to_numpy(zero_copy_only=False)
+        if not np.array_equal(s_ids, o_ids):
+            problems.append(f"shard {k:05d}: doc_ids do NOT align with the source shard")
+    return problems
