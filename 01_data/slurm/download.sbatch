@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=kys3b_download
 #SBATCH --partition=med
-#SBATCH --qos=cpu_qos
+#SBATCH --qos=jhu2          # association QOS; cpu_qos is med's PARTITION QoS and is not requestable
 #SBATCH --account=bvandur1_blabscify
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

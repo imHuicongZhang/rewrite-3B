@@ -39,10 +39,26 @@ class TestClaims(unittest.TestCase):
         b = ClaimDir(self.dir, stale_seconds=0)
         self.assertTrue(b.try_claim(5), "a claim past its heartbeat window must be reclaimable")
 
-    def test_unreadable_claim_is_treated_as_stale(self):
+    def test_unreadable_claim_is_judged_by_mtime_not_assumed_stale(self):
+        """An unparseable claim is NOT automatically stealable.
+
+        Assuming "cannot parse => stale" would let a second worker steal a shard that was just
+        legitimately claimed, because on a filesystem without hard links the claim path exists
+        for a moment before its payload lands.  A corrupt claim is judged by the same age rule
+        as any other, from its mtime.
+        """
         self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / "shard_00007.claim").write_text("{not json")
-        self.assertTrue(ClaimDir(self.dir).try_claim(7))
+        f = self.dir / "shard_00007.claim"
+        f.write_text("{not json")
+        self.assertFalse(
+            ClaimDir(self.dir, stale_seconds=3600).try_claim(7),
+            "a freshly written (if corrupt) claim must not be stealable",
+        )
+        os.utime(f, (0, 0))  # now genuinely old
+        self.assertTrue(
+            ClaimDir(self.dir, stale_seconds=3600).try_claim(7),
+            "an old corrupt claim must be reclaimable",
+        )
 
     def test_heartbeat_keeps_a_claim_alive(self):
         a = ClaimDir(self.dir, stale_seconds=3600)

@@ -17,7 +17,10 @@ import pyarrow.parquet as pq
 from .io import atomic_write_json, atomic_write_table, check, log, parquet_rows
 from .pool import doc_id_to_shard
 
-TEXT_COLS = ["doc_id", "text"]
+# `tokens-llama2` is carried into the materialized shard so downstream stages have EXACT source
+# token counts per shard without re-opening the 182 GB pool.  It does not change the text sent to
+# the rewriter, and it does not change selection.
+TEXT_COLS = ["doc_id", "text", "tokens-llama2"]
 
 
 def shard_path(out_dir: Path, i: int) -> Path:
@@ -81,26 +84,32 @@ def materialize(
                 m = psh == ps
                 need.setdefault(int(ps), []).append((si, prow[m], ids[m]))
 
-        buf: dict[int, dict[int, str]] = {si: {} for si in batch}
+        buf: dict[int, dict[int, tuple[str, int]]] = {si: {} for si in batch}
         for ps in sorted(need):
             t = pq.read_table(cfg.pool_shard(ps), columns=TEXT_COLS, use_threads=False)
             pool_ids = t.column("doc_id").to_numpy(zero_copy_only=False)
             texts = t.column("text").to_pylist()
+            ntok = t.column("tokens-llama2").to_numpy(zero_copy_only=False)
             for si, prow, ids in need[ps]:
                 check(
                     bool(np.array_equal(pool_ids[prow], ids)),
                     f"{setting} shard {si}: doc_id mismatch reading pool shard {ps}",
                 )
                 for did, r in zip(ids.tolist(), prow.tolist()):
-                    buf[si][did] = texts[r]
-            del t, texts, pool_ids
+                    buf[si][did] = (texts[r], int(ntok[r]))
+            del t, texts, pool_ids, ntok
 
         for si in batch:
             ids = groups[si]
+            rows = [buf[si][int(d)] for d in ids]
             tbl = pa.table(
                 {
                     "doc_id": pa.array(ids, type=pa.int64()),
-                    "text": pa.array([buf[si][int(d)] for d in ids], type=pa.large_string()),
+                    "text": pa.array([r[0] for r in rows], type=pa.large_string()),
+                    # source length, no BOS -- TRAIN length is this + 1
+                    "tokens_llama2": pa.array(
+                        np.array([r[1] for r in rows], dtype=np.int32), type=pa.int32()
+                    ),
                 }
             )
             atomic_write_table(tbl, shard_path(out_dir, si))
@@ -109,21 +118,34 @@ def materialize(
         del buf, need
         log(f"{setting}: {written}/{len(todo)} shards written")
 
-    index = dict(
-        setting=setting,
-        rows_per_shard=rows_per_shard,
-        n_shards=len(groups),
-        total_docs=int(len(doc_ids)),
-        shards=[
+    # Exact per-shard source train-token totals, read back from what was actually written.
+    # `bin/calibrate.py` uses these instead of a row-fraction proxy, and
+    # `bin/validate.py --stage sources` checks their sum against the selection manifest.
+    shard_meta = []
+    total_train_tokens = 0
+    for si, g in enumerate(groups):
+        sp = shard_path(out_dir, si)
+        tt = pq.read_table(sp, columns=["tokens_llama2"], use_threads=False)
+        nt = tt.column("tokens_llama2").to_numpy(zero_copy_only=False).astype(np.int64)
+        train = int(nt.sum() + nt.size)  # +1 BOS per document
+        total_train_tokens += train
+        shard_meta.append(
             dict(
                 shard=si,
                 rows=int(g.size),
                 doc_id_min=int(g[0]),
                 doc_id_max=int(g[-1]),
-                file=shard_path(out_dir, si).name,
+                file=sp.name,
+                source_train_tokens=train,
             )
-            for si, g in enumerate(groups)
-        ],
+        )
+    index = dict(
+        setting=setting,
+        rows_per_shard=rows_per_shard,
+        n_shards=len(groups),
+        total_docs=int(len(doc_ids)),
+        total_source_train_tokens=total_train_tokens,
+        shards=shard_meta,
     )
     atomic_write_json(index, out_dir / "_shards.json")
     log(f"{setting}: index -> {out_dir/'_shards.json'}")

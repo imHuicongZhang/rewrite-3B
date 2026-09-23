@@ -226,6 +226,67 @@ class TestIntegration(unittest.TestCase):
         for _, got in results:
             self.assertTrue(np.array_equal(got, ids))
 
+    def test_02_source_shards_carry_exact_token_counts(self):
+        """`tokens_llama2` travels with the shard, and the totals reconcile to the selection.
+
+        This is what makes calibration exact and lets stage-02 validation check the token sum
+        against the selection manifest -- neither is possible from a row fraction.
+        """
+        setting = "quality-first"
+        ids = np.sort(self.sel.blocks[setting].idx)
+        out = self.cfg.stage("sources") / setting
+        index = materialize(self.cfg, setting, ids, out, ROWS_PER_SOURCE_SHARD)
+
+        total = 0
+        for sh in index["shards"]:
+            t = pq.read_table(out / sh["file"], columns=["doc_id", "tokens_llama2"],
+                              use_threads=False)
+            nt = t.column("tokens_llama2").to_numpy(zero_copy_only=False).astype(np.int64)
+            # the column must equal the pool's own tokens-llama2 for those doc_ids
+            d = t.column("doc_id").to_numpy(zero_copy_only=False)
+            self.assertTrue(np.array_equal(nt + 1, self.pool.tok[d]),
+                            "source token counts must match the pool exactly")
+            shard_train = int(nt.sum() + nt.size)
+            self.assertEqual(shard_train, sh["source_train_tokens"])
+            total += shard_train
+        self.assertEqual(total, index["total_source_train_tokens"])
+        self.assertEqual(
+            total, self.sel.blocks[setting].tokens,
+            "materialized train tokens must equal the selection exactly",
+        )
+
+    def test_02_calibration_on_real_shards_is_exact(self):
+        """End-to-end: materialize -> fake rewrite -> exact r, with no row-fraction proxy."""
+        from kys3b.calibration import aggregate
+
+        setting = "quality-first"
+        ids = np.sort(self.sel.blocks[setting].idx)
+        src = self.cfg.stage("sources") / setting
+        materialize(self.cfg, setting, ids, src, ROWS_PER_SOURCE_SHARD)
+        rng = np.random.default_rng(99)
+        fake_rewrite(self.cfg, setting, "p1", rng)
+        n = load_index(src)["n_shards"]
+        out = self.cfg.stage("rewritten") / setting / "p1"
+
+        agg = aggregate(src, out, range(n))
+        # recompute independently, straight from the files
+        exp_src = exp_out = exp_src_s2 = 0
+        for k in range(n):
+            st = pq.read_table(shard_path(src, k), columns=["tokens_llama2"], use_threads=False)
+            ot = pq.read_table(shard_path(out, k), columns=["status", "rewritten_tokens"],
+                               use_threads=False)
+            nt = st.column("tokens_llama2").to_numpy(zero_copy_only=False).astype(np.int64) + 1
+            sv = ot.column("status").to_numpy(zero_copy_only=False)
+            rt = ot.column("rewritten_tokens").to_numpy(zero_copy_only=False).astype(np.int64)
+            exp_src += int(nt.sum())
+            exp_src_s2 += int(nt[sv == 2].sum())
+            exp_out += int(rt[sv == 2].sum())
+        self.assertEqual(agg["src_train_tokens_all"], exp_src)
+        self.assertEqual(agg["src_train_tokens_status2"], exp_src_s2)
+        self.assertEqual(agg["out_tokens_status2"], exp_out)
+        self.assertAlmostEqual(agg["r_census"], exp_out / exp_src, places=12)
+        self.assertGreater(agg["r_status2"], agg["r_census"])
+
     # ---------------------------------------------------------------- stages 03-05
     def _run_arm(self, setting):
         ids = np.sort(self.sel.blocks[setting].idx)

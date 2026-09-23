@@ -18,6 +18,19 @@ detail is preserved:
 Deviation from 1.5B, approved as Decision 8: shard ownership is a claim directory rather
 than `shard_idx % num_workers`.  Per-document output is unaffected -- it depends only on
 (shard_index, row_index).
+
+Bounded smoke mode.  Two independent limits, both absent in production:
+
+  --max-shards N   take at most N shards, then exit cleanly.  Output goes to the NORMAL
+                   production path, so a completed smoke shard is ordinary finished work that
+                   later production jobs correctly skip.  Nothing else is affected: unclaimed
+                   shards stay unclaimed, and no shard is ever marked done without a full,
+                   row-complete output.
+
+  --smoke-rows N   additionally process only the first N rows of the claimed shard AND divert
+                   the output to `<setting>/_smoke/<pass>/`, never the production path.  A
+                   partial shard therefore cannot be mistaken for finished work -- production
+                   still sees that shard as outstanding.  This is the truly tiny mode.
 """
 from __future__ import annotations
 
@@ -136,8 +149,16 @@ def run(args) -> int:
         else:
             mode, template, wp = "grounded", load_text("p1_wiki"), None
 
+    smoke_rows = getattr(args, "smoke_rows", None)
+    max_shards = getattr(args, "max_shards", None)
     src_dir = cfg.stage("sources") / setting
-    out_dir = cfg.stage("rewritten") / setting / spec["out_subdir"]
+    prod_dir = cfg.stage("rewritten") / setting / spec["out_subdir"]
+    # In --smoke-rows mode the shard is PARTIAL, so it must never land on the production path.
+    out_dir = (
+        cfg.stage("rewritten") / setting / "_smoke" / spec["out_subdir"]
+        if smoke_rows
+        else prod_dir
+    )
     # Raw-source guarantee (the 1.5B 09_Distill assertion): never read an output dir.
     check(
         cfg.stage("rewritten") not in src_dir.parents and src_dir.name != "p1",
@@ -157,7 +178,12 @@ def run(args) -> int:
     )
 
     def done(s: int) -> bool:
-        p = shard_path(out_dir, s)
+        """Completion is always judged on the PRODUCTION output, never the smoke output.
+
+        A full-row production shard is finished work; a partial smoke shard is not, and must not
+        make production skip it.
+        """
+        p = shard_path(prod_dir, s)
         if not p.exists():
             return False
         try:
@@ -170,6 +196,12 @@ def run(args) -> int:
         f"{setting}/{args.pass_name}: {n_shards} shards, {n_shards-len(todo_now)} already done, "
         f"{len(todo_now)} outstanding"
     )
+    if max_shards is not None or smoke_rows is not None:
+        log(
+            f"SMOKE MODE: max_shards={max_shards} smoke_rows={smoke_rows} "
+            f"-> output {out_dir}"
+            + ("  (partial rows; NOT production output)" if smoke_rows else "")
+        )
     if not todo_now:
         log("nothing to do")
         return 0
@@ -213,18 +245,29 @@ def run(args) -> int:
     monitor_every = int(cfg.vllm["monitor_every"])
     monitor_file = cfg.stage("logs") / f"monitor_{setting}_{args.pass_name}.md"
 
-    for shard in claims.iter_available(range(n_shards), done):
+    for shard in claims.iter_available(range(n_shards), done, max_shards=max_shards):
         try:
             t = pq.read_table(shard_path(src_dir, shard), use_threads=False)
             doc_ids = t.column("doc_id").to_numpy(zero_copy_only=False)
             texts = t.column("text").to_pylist()
-            n_rows = len(texts)
             check(
-                n_rows == int(index["shards"][shard]["rows"]),
-                f"shard {shard}: {n_rows} rows != index {index['shards'][shard]['rows']}",
+                len(texts) == int(index["shards"][shard]["rows"]),
+                f"shard {shard}: {len(texts)} rows != index {index['shards'][shard]['rows']}",
             )
+            if smoke_rows:
+                # style assignment stays keyed on (42, shard_index) and is drawn for the FULL
+                # shard below, so the styles of the first N rows are the production ones
+                doc_ids = doc_ids[:smoke_rows]
+                texts = texts[:smoke_rows]
+            n_rows = len(texts)
 
-            styles = assign_wrap_styles(shard, n_rows, cfg.seed) if mode == "wrap" else [None] * n_rows
+            if mode == "wrap":
+                # always draw the FULL shard so row i keeps its production style even in smoke mode
+                styles = assign_wrap_styles(
+                    shard, int(index["shards"][shard]["rows"]), cfg.seed
+                )[:n_rows]
+            else:
+                styles = [None] * n_rows
 
             prompts, params, keep_pos, n_in_all = [], [], [], [0] * n_rows
             status = [0] * n_rows
@@ -349,6 +392,15 @@ def main(argv=None) -> int:
     ap.add_argument("--pass", dest="pass_name", required=True, choices=list(PASSES))
     ap.add_argument("--dry-run", action="store_true", help="build prompts only, no GPU")
     ap.add_argument("--dry-rows", type=int, default=20)
+    ap.add_argument(
+        "--max-shards", type=int, default=None,
+        help="take at most N shards then exit cleanly; output is normal production work",
+    )
+    ap.add_argument(
+        "--smoke-rows", type=int, default=None,
+        help="process only the first N rows of the claimed shard and write to <setting>/_smoke/, "
+             "never the production path (truly tiny mode)",
+    )
     return run(ap.parse_args(argv))
 
 

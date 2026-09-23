@@ -10,6 +10,7 @@ from helpers import *  # noqa: F401,F403
 
 from kys3b.io import (
     Stop,
+    atomic_save_npy,
     atomic_write_table,
     bucketed_shuffle,
     paired_wiki_status,
@@ -53,6 +54,75 @@ class TestAtomicWrite(unittest.TestCase):
             except Exception:
                 pass
             self.assertEqual(list((d / "sub").glob("*.tmp")), [], "a stale .tmp was left behind")
+
+
+class TestAtomicSaveNpy(unittest.TestCase):
+    """`np.save(path, arr)` APPENDS '.npy' when the path does not end in it.
+
+    Passing a temp path like `doc_ids.npy.tmp` therefore made numpy write
+    `doc_ids.npy.tmp.npy`, the rename failed on a missing file, and a stray artifact was left
+    behind -- `01_select.py --phase commit` would have died on its very first block.  The fix
+    writes through an explicit file handle so numpy never touches the filename.
+    """
+
+    def test_writes_exactly_the_requested_destination(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            dest = d / "doc_ids.npy"
+            atomic_save_npy(np.arange(5, dtype=np.int64), dest)
+            self.assertTrue(dest.exists())
+            self.assertEqual(sorted(p.name for p in d.iterdir()), ["doc_ids.npy"])
+
+    def test_no_tmp_or_double_suffix_artifact_remains(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            atomic_save_npy(np.arange(3, dtype=np.int64), d / "doc_ids.npy")
+            names = {p.name for p in d.iterdir()}
+            self.assertNotIn("doc_ids.npy.tmp", names)
+            self.assertNotIn("doc_ids.npy.tmp.npy", names)
+            self.assertEqual(list(d.glob("*.tmp*")), [])
+
+    def test_round_trips_values_and_dtype_exactly(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "doc_ids.npy"
+            for arr in (
+                np.arange(1000, dtype=np.int64),
+                np.array([], dtype=np.int64),
+                np.array([2**62, -1, 0], dtype=np.int64),
+                np.random.default_rng(0).random(50).astype(np.float32),
+            ):
+                atomic_save_npy(arr, dest)
+                back = np.load(dest)
+                self.assertEqual(back.dtype, arr.dtype)
+                self.assertTrue(np.array_equal(back, arr))
+                self.assertEqual(back.tobytes(), arr.tobytes())
+
+    def test_overwrite_is_idempotent_and_leaves_one_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            dest = d / "doc_ids.npy"
+            a = np.arange(10, dtype=np.int64)
+            atomic_save_npy(a, dest)
+            atomic_save_npy(a, dest)          # same content
+            self.assertTrue(np.array_equal(np.load(dest), a))
+            atomic_save_npy(a * 3, dest)      # different content
+            self.assertTrue(np.array_equal(np.load(dest), a * 3))
+            self.assertEqual(sorted(p.name for p in d.iterdir()), ["doc_ids.npy"])
+
+    def test_creates_missing_parent_directories(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "a" / "b" / "doc_ids.npy"
+            atomic_save_npy(np.arange(4, dtype=np.int64), dest)
+            self.assertTrue(dest.exists())
+
+    def test_a_file_without_the_npy_suffix_still_round_trips(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            dest = d / "ids.bin"
+            a = np.arange(6, dtype=np.int64)
+            atomic_save_npy(a, dest)
+            self.assertEqual(sorted(p.name for p in d.iterdir()), ["ids.bin"])
+            self.assertTrue(np.array_equal(np.load(dest), a))
 
 
 class TestBucketedShuffle(unittest.TestCase):

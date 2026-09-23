@@ -96,11 +96,22 @@ def _json_default(o):
 
 
 def atomic_save_npy(arr: np.ndarray, dest: Path) -> None:
+    """Atomically write `arr` to `dest` (which must end in .npy).
+
+    `np.save(path, arr)` APPENDS ".npy" when the path does not already end in it, so passing a
+    temporary path like `doc_ids.npy.tmp` makes numpy write `doc_ids.npy.tmp.npy` and the
+    subsequent os.replace then fails on a missing file, leaving a stray artifact behind.  Writing
+    through an explicit file handle bypasses that rewriting entirely.  The handle is fsynced
+    before the rename so a node failure cannot leave a renamed-but-empty file.
+    """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".npy.tmp")
+    tmp = dest.with_name(dest.name + ".tmp")
     try:
-        np.save(tmp, arr)
+        with open(tmp, "wb") as f:
+            np.save(f, arr)          # explicit handle -> numpy does NOT touch the filename
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, dest)
     except BaseException:
         try:

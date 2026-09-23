@@ -81,14 +81,21 @@ def v_sources(cfg):
             m["selection_doc_ids_sha256"] == sm["doc_ids_sha256"],
             f"{setting}: sources were built from a different selection",
         )
-        total, seen = 0, []
+        total, seen, train_tokens = 0, [], 0
         for s in idx["shards"]:
             p = d / s["file"]
             check(p.exists(), f"missing {p}")
             check(parquet_rows(p) == s["rows"], f"{p}: row count != index")
             total += s["rows"]
-            t = pq.read_table(p, columns=["doc_id"], use_threads=False)
+            t = pq.read_table(p, columns=["doc_id", "tokens_llama2"], use_threads=False)
             seen.append(t.column("doc_id").to_numpy(zero_copy_only=False))
+            nt = t.column("tokens_llama2").to_numpy(zero_copy_only=False).astype(np.int64)
+            shard_train = int(nt.sum() + nt.size)  # +1 BOS per document
+            check(
+                shard_train == int(s["source_train_tokens"]),
+                f"{p}: source train tokens {shard_train:,} != index {s['source_train_tokens']:,}",
+            )
+            train_tokens += shard_train
         check(total == idx["total_docs"], f"{setting}: {total} rows != {idx['total_docs']}")
         allids = np.concatenate(seen)
         check(np.unique(allids).size == allids.size, f"{setting}: duplicate doc_id across shards")
@@ -96,7 +103,17 @@ def v_sources(cfg):
             int(allids.size) == int(sm["docs"]),
             f"{setting}: {allids.size} materialized != {sm['docs']} selected",
         )
-        log(f"{OK} {setting:22s} {idx['n_shards']:>5} shards, {total:>12,} docs, ids unique")
+        # The plan's stage-02 promise: the materialized token total must equal the selection
+        # manifest EXACTLY.  This is only checkable because tokens_llama2 travels with the shard.
+        check(
+            train_tokens == int(sm["train_tokens"]),
+            f"{setting}: materialized {train_tokens:,} train tokens != selection "
+            f"{sm['train_tokens']:,}",
+        )
+        log(
+            f"{OK} {setting:22s} {idx['n_shards']:>5} shards, {total:>12,} docs, ids unique, "
+            f"{train_tokens:>15,} train tokens == selection"
+        )
 
 
 def v_rewritten(cfg):

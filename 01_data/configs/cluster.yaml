@@ -26,8 +26,12 @@ gpu:
       requeue: true
 
 cpu:
-  partition: med                 # 74 nodes, 108 CPU/node, MaxMemPerCPU=4000, QoS cpu_qos
-  qos: cpu_qos
+  partition: med                 # 74 nodes, 108 CPU/node, MaxMemPerCPU=4000
+  # `med` carries QoS=cpu_qos as its PARTITION QoS, which Slurm applies automatically and which
+  # is NOT requestable by this user: `--qos=cpu_qos` fails with "Invalid qos specification".
+  # The requestable QOS are the association ones -- jhu2 (bvandur1_blabscify) and scavenger
+  # (bvandur1) -- which is what this user's own med jobs run under.  Caught by sbatch --test-only.
+  qos: jhu2
   account: bvandur1_blabscify
   cpus_per_task: 96
   mem: "360G"

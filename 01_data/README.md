@@ -89,6 +89,26 @@ sbatch slurm/materialize.sbatch
 $E bin/validate.py --stage sources
 ```
 
+### 3a. Bounded GPU smoke test
+
+One task, one shard, a handful of documents -- never an array, never the production wall time.
+
+```bash
+$E bin/smoke_launch.py                 # PRINTS the 5 commands, submits nothing
+$E bin/smoke_launch.py --test-only     # validate them (creates no job)
+$E bin/smoke_launch.py --submit        # run them
+```
+
+Covers every distinct worker path: grounded Wikipedia (`quality-first/p1`), distill
+(`quality-first/distill`), the WRAP 4-style assignment (`wrap-inspired/p1`), and both REWIRE
+inputs. `diversity-oriented` and `disagreement-aware` share the grounded path with
+`quality-first` and are not smoke-tested separately.
+
+With `--smoke-rows` (default 64) the output goes to `<setting>/_smoke/<pass>/`, **never** the
+production path, so a smoke run cannot make a later production job skip data. The worker also
+accepts `--max-shards N` on its own, which writes ordinary full-row production output that
+production correctly treats as finished work.
+
 ### 3. Rewriting -- both passes, all five arms
 
 ```bash
@@ -97,7 +117,7 @@ $E bin/03_rewrite_launch.py                   # PRINTS the 10 sbatch lines, subm
 $E bin/03_rewrite_launch.py --test-only       # validate them (creates no job)
 $E bin/03_rewrite_launch.py --queue both --submit     # actually queue
 $E bin/status.py                              # progress + claim state
-$E bin/calibrate.py                           # measured r vs the 1.5B census
+$E bin/calibrate.py                           # EXACT measured r vs the 1.5B census
 $E bin/validate.py --stage rewritten
 ```
 
@@ -135,6 +155,14 @@ $E bin/validate.py --stage final
   preempted scavenger task costs one 10,000-row shard, not a whole array index's backlog.
 * **Manifests are the contract.** Each stage validates the previous stage's manifest and records
   the code commit.
+* **Exact token accounting.** `tokens_llama2` travels with every materialized source shard, so
+  `bin/calibrate.py` measures the compression ratio from summed tokens rather than a row-fraction
+  proxy, and `bin/validate.py --stage sources` reconciles the materialized token total against the
+  selection manifest exactly.
+* **Single-winner claims.** First claim is `os.link` of a fully-written file (atomic, and never
+  visible half-written); stale reclaim is serialised by an `os.mkdir` guard, so a live claim is
+  never moved and two workers can never both own a shard. Verified under 32 concurrent processes
+  x 60 stampedes on WekaFS.
 
 ## Decision 1, in one paragraph
 
