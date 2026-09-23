@@ -131,6 +131,14 @@ class Config:
         check(not extra, f"configs/vllm.yaml sampling has non-1.5B kwargs: {sorted(extra)}")
         return s
 
+    @property
+    def heartbeat_seconds(self) -> int:
+        return int(self.budgets["sharding"]["heartbeat_seconds"])
+
+    @property
+    def claim_stale_seconds(self) -> int:
+        return int(self.budgets["sharding"]["claim_stale_seconds"])
+
     def input_drop(self, pass_name: str) -> int:
         check(pass_name in PASSES, f"unknown pass {pass_name!r}")
         return int(self.vllm["input_drop"][pass_name])
@@ -189,6 +197,14 @@ class Config:
             f"training.horizons must be [1,2,3]*epoch_tokens, got {t['horizons']}",
         )
         check(len(t["seeds"]) == 3, f"expected 3 seeds, got {t['seeds']}")
+        sh = self.budgets["sharding"]
+        hb, stale = int(sh["heartbeat_seconds"]), int(sh["claim_stale_seconds"])
+        check(hb > 0, f"heartbeat_seconds must be positive, got {hb}")
+        check(
+            hb * 3 <= stale,
+            f"heartbeat_seconds ({hb}) * 3 must be <= claim_stale_seconds ({stale}) so a claim "
+            "survives a few missed refreshes before it is judged dead",
+        )
 
 
 def env_offline() -> None:

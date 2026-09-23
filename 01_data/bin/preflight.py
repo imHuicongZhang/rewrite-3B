@@ -11,12 +11,16 @@
   8  the WRAP style assignment matches a pinned PCG64 golden vector
   9  storage roots exist / are writable and have headroom
  10  engine and sampling kwargs are exactly the 1.5B five / three
+ 11  the heartbeat interval is well inside the claim staleness window
+ 12  the claim protocol's filesystem primitives (mkdir, link, rename) work on the data root
+ 13  worker identity is unique across the primary and opportunistic arrays
 """
 from __future__ import annotations
 
 import argparse
 import shutil
 import sys
+from pathlib import Path
 
 import _bootstrap  # noqa: F401
 
@@ -94,6 +98,59 @@ def main(argv=None) -> int:
         free_gb = shutil.disk_usage(cfg.root("data")).free / 2**30
         check(free_gb > 1000, f"only {free_gb:.0f} GB free at {cfg.root('data')}; need > 1 TB")
         ok.append(f"9  storage roots writable; {free_gb:.0f} GB free at {cfg.root('data')}")
+
+    ok.append(
+        f"11 heartbeat {cfg.heartbeat_seconds}s x3 <= claim staleness {cfg.claim_stale_seconds}s"
+    )
+
+    # The claim protocol needs atomic mkdir / link / rename on the filesystem that will actually
+    # hold the claim directories.  WekaFS provides all three, but assert it rather than assume.
+    import os
+    import tempfile
+
+    probe = cfg.root("data") / ".cache" / "_preflight_fsprobe"
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=str(probe.parent)) as td:
+        td = Path(td)
+        os.mkdir(td / "g")
+        try:
+            os.mkdir(td / "g")
+            check(False, "mkdir is not single-winner on this filesystem")
+        except FileExistsError:
+            pass
+        (td / "a").write_text("x")
+        os.link(td / "a", td / "b")
+        try:
+            os.link(td / "a", td / "b")
+            check(False, "link is not single-winner on this filesystem")
+        except FileExistsError:
+            pass
+        os.replace(td / "b", td / "c")
+        check((td / "c").exists(), "replace did not move the file")
+    ok.append("12 claim primitives verified on the data root: mkdir, link, replace all atomic")
+
+    # primary task 0 and scavenger task 0 must not be the same worker
+    from kys3b.claims import ClaimDir
+
+    def _key(array_job, task):
+        saved = {k: os.environ.get(k) for k in
+                 ("SLURM_ARRAY_JOB_ID", "SLURM_ARRAY_TASK_ID", "SLURM_JOB_ID")}
+        os.environ.update(SLURM_ARRAY_JOB_ID=str(array_job), SLURM_ARRAY_TASK_ID=str(task),
+                          SLURM_JOB_ID=str(array_job + task))
+        try:
+            return ClaimDir.worker_key()
+        finally:
+            for k, v in saved.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    check(
+        _key(111111, 0) != _key(222222, 0),
+        "worker_key collides across arrays -- primary task 0 and scavenger task 0 would share "
+        "a progress file",
+    )
+    ok.append("13 worker_key is unique across the primary and opportunistic arrays")
 
     print("\n=== PREFLIGHT PASSED ===")
     for line in ok:

@@ -19,7 +19,7 @@
 : "${KYS_SETTING:?set KYS_SETTING}"
 : "${KYS_PASS:?set KYS_PASS}"
 KYS_SMOKE_ROWS="${KYS_SMOKE_ROWS:-64}"
-export KYS_NS="smoke/${KYS_SETTING}/${KYS_PASS}"
+export KYS_NS="smoke/${KYS_SETTING}/${KYS_PASS}/${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}/${SLURM_ARRAY_TASK_ID:-0}"
 source /weka/scratch/jhu/bvandur1/zhuicon1/projects/rewrite-3B/01_data/slurm/_common.sh
 
 PY=$(python3 - <<'PYX'

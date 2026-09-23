@@ -80,3 +80,49 @@ def aggregate(src_dir, out_dir, shards) -> dict:
     agg["r_census"] = agg["out_tokens_status2"] / max(1, agg["src_train_tokens_all"])
     agg["r_status2"] = agg["out_tokens_status2"] / max(1, agg["src_train_tokens_status2"])
     return agg
+
+
+# --------------------------------------------------------------------------- pilot shard choice
+DEFAULT_PILOT_SHARDS = 12  # within the requested 8-16 band
+
+
+def pilot_shards(n_shards: int, k: int = DEFAULT_PILOT_SHARDS) -> list[int]:
+    """`k` shard indices spread evenly across the WHOLE range, deterministically.
+
+    NOT the first k.  Source shards are contiguous slices of a doc_id-sorted selection, and
+    doc_id order is pool position, so the first shards are a systematically different slice of
+    the corpus -- different document lengths, and for the fastText-ranked arms a different
+    quality band.  Calibrating on them would bias r exactly where it matters least.
+
+    Indices are the k mid-quantile positions: round((i + 0.5) * n / k) for i in 0..k-1, clipped
+    into range and de-duplicated.  Pure function of (n_shards, k), so the pilot set is
+    reproducible and recordable.
+    """
+    if n_shards <= 0 or k <= 0:
+        return []
+    if k >= n_shards:
+        return list(range(n_shards))
+    out = []
+    for i in range(k):
+        idx = int((i + 0.5) * n_shards / k)
+        out.append(min(n_shards - 1, max(0, idx)))
+    return sorted(dict.fromkeys(out))
+
+
+def project_yield(cfg, per_pass_r: dict[str, float], source_budget: int) -> dict:
+    """Project a full-arm rewritten-token yield from measured per-pass r_census."""
+    p1 = per_pass_r.get("p1")
+    dis = per_pass_r.get("distill")
+    out = dict(
+        r_p1=p1, r_distill=dis, source_budget=int(source_budget), target=int(cfg.B),
+    )
+    if p1 is None or dis is None:
+        out["complete"] = False
+        return out
+    out["complete"] = True
+    out["projected_p1_tokens"] = p1 * source_budget
+    out["projected_distill_tokens"] = dis * source_budget
+    out["projected_total_tokens"] = (p1 + dis) * source_budget
+    out["headroom_pct"] = 100.0 * (out["projected_total_tokens"] / cfg.B - 1.0)
+    out["meets_target"] = out["projected_total_tokens"] >= cfg.B
+    return out

@@ -54,6 +54,11 @@ training:
 sharding:
   rows_per_shard: 10000
   claim_stale_seconds: 1800     # 30 min without a heartbeat -> reclaimable
+  # A background thread refreshes the claim every `heartbeat_seconds` while a shard is being
+  # generated, so a slow shard cannot become reclaimable while its owner is still working.
+  # preflight asserts heartbeat_seconds * 3 <= claim_stale_seconds, i.e. three refreshes may be
+  # missed before a claim is considered dead.
+  heartbeat_seconds: 300
 
 # ---- the six settings ------------------------------------------------------------------
 # rewrite: null           -> raw, never sent to a GPU

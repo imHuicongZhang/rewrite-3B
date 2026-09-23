@@ -23,7 +23,11 @@
 # Required exports: KYS_SETTING, KYS_PASS
 : "${KYS_SETTING:?set KYS_SETTING}"
 : "${KYS_PASS:?set KYS_PASS}"
-export KYS_NS="rewrite/${KYS_SETTING}/${KYS_PASS}/${SLURM_ARRAY_TASK_ID:-0}"
+# The namespace MUST include the array job id.  The primary jhu2 array and the
+# opportunistic scavenger array both number their tasks from 0, so a task-id-only
+# namespace would let primary task 0 and scavenger task 0 share TMPDIR,
+# VLLM_CACHE_ROOT and TORCHINDUCTOR_CACHE_DIR while running concurrently.
+export KYS_NS="rewrite/${KYS_SETTING}/${KYS_PASS}/${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-local}}/${SLURM_ARRAY_TASK_ID:-0}"
 source /weka/scratch/jhu/bvandur1/zhuicon1/projects/rewrite-3B/01_data/slurm/_common.sh
 
 PY=$(python3 - <<'PYX'

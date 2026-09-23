@@ -45,6 +45,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -54,22 +55,49 @@ PRIVATE_SUFFIX = ".tmp"   # private, per-process scratch beside a claim
 
 
 class ClaimDir:
-    def __init__(self, directory: Path, stale_seconds: int = 1800):
+    def __init__(self, directory: Path, stale_seconds: float = 1800):
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.stale_seconds = int(stale_seconds)
+        # float, not int: `int(0.3)` is 0, which would make every claim instantly stale.  That
+        # only bites sub-second windows (tests), but truncating a caller's value silently is the
+        # kind of thing that looks fine until it does not.
+        self.stale_seconds = float(stale_seconds)
         self._live_jobs: set[str] | None = None
         self._live_jobs_at = 0.0
 
     # ------------------------------------------------------------------ identity
     @staticmethod
     def identity() -> dict:
+        """Who this process is.
+
+        `array_job` is SLURM_ARRAY_JOB_ID (the id shared by every task of one array), falling
+        back to SLURM_JOB_ID.  It is what distinguishes the primary jhu2 array from the
+        opportunistic scavenger array: both number their tasks from 0, so the task id ALONE is
+        not a unique worker identity.
+        """
         return dict(
             worker=os.environ.get("SLURM_ARRAY_TASK_ID", "local"),
+            array_job=os.environ.get("SLURM_ARRAY_JOB_ID")
+            or os.environ.get("SLURM_JOB_ID")
+            or "local",
             host=socket.gethostname(),
             jobid=os.environ.get("SLURM_JOB_ID", ""),
             pid=os.getpid(),
         )
+
+    @staticmethod
+    def worker_key() -> str:
+        """A globally unique worker identifier, safe as a filename component.
+
+        Includes the array job id AND the task id, so primary task 0 and scavenger task 0 never
+        collide, plus host and pid so two local runs -- or a requeued task that gets the same
+        (array_job, task) with a fresh process -- also stay distinct.  A requeued task therefore
+        writes a NEW progress file rather than overwriting the record of the work it did before
+        being preempted.
+        """
+        i = ClaimDir.identity()
+        safe = str(i["host"]).replace("/", "_")
+        return f"{i['array_job']}_t{i['worker']}_{safe}_p{i['pid']}"
 
     def _is_mine(self, meta: dict) -> bool:
         me = self.identity()
@@ -353,3 +381,75 @@ class ClaimDir:
             stale=len(stale),
             pending=len(pending),
         )
+
+
+class Heartbeat:
+    """Keep a claim live while a long, blocking section runs.  Use as a context manager.
+
+    `llm.generate()` blocks for the whole shard.  A single heartbeat before the call is not
+    enough: `claim_stale_seconds` is 1800 and a 10,000-row shard is only *projected* at 15-20
+    minutes, so a slow shard -- long documents, a contended node, a cold compile -- would become
+    reclaimable while its owner is still actively generating, and two workers would do the same
+    work.
+
+    A daemon thread refreshes the claim every `interval` seconds until the section ends.  It is
+    always joined on exit, so no thread is leaked; `daemon=True` only covers an interpreter that
+    dies without unwinding.  Refreshing goes through `ClaimDir.heartbeat`, which is a no-op when
+    this process is not the owner, so a worker whose claim was legitimately reclaimed never
+    touches the new owner's claim.  Errors are counted and surfaced once rather than silently
+    swallowed, and a failed refresh can never write a partial claim (heartbeat writes to a
+    per-process temp and renames).
+    """
+
+    def __init__(self, claims: "ClaimDir", shard: int, interval: float = 300.0):
+        self.claims = claims
+        self.shard = shard
+        self.interval = float(interval)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.beats = 0
+        self.errors = 0
+        self.last_error: BaseException | None = None
+
+    def _loop(self) -> None:
+        # Event.wait doubles as the sleep AND the stop signal, so exit is immediate.
+        while not self._stop.wait(self.interval):
+            try:
+                self.claims.heartbeat(self.shard)
+                self.beats += 1
+            except BaseException as e:  # noqa: BLE001 -- a monitor thread must not die silently
+                self.errors += 1
+                self.last_error = e
+
+    def __enter__(self) -> "Heartbeat":
+        if self.interval <= 0:
+            return self  # disabled
+        try:
+            self.claims.heartbeat(self.shard)  # refresh immediately, then periodically
+        except BaseException as e:  # noqa: BLE001 -- entering must not fail the shard
+            self.errors += 1
+            self.last_error = e
+        self._thread = threading.Thread(
+            target=self._loop, name=f"heartbeat-{self.shard:05d}", daemon=True
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # Runs on the normal path AND on an exception, so the thread always stops.
+        self._stop.set()
+        t, self._thread = self._thread, None
+        if t is not None:
+            t.join(timeout=max(5.0, min(30.0, self.interval)))
+            if t.is_alive():
+                log(f"  WARNING: heartbeat thread for shard {self.shard:05d} did not stop")
+        if self.errors:
+            log(
+                f"  WARNING: {self.errors} heartbeat error(s) on shard {self.shard:05d}; "
+                f"last: {self.last_error!r}"
+            )
+        return False  # never suppress the original exception
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()

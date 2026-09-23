@@ -31,6 +31,15 @@ Bounded smoke mode.  Two independent limits, both absent in production:
                    the output to `<setting>/_smoke/<pass>/`, never the production path.  A
                    partial shard therefore cannot be mistaken for finished work -- production
                    still sees that shard as outstanding.  This is the truly tiny mode.
+
+  --pilot K        restrict this worker to the K deterministic pilot shards spread evenly across
+                   the WHOLE shard range (`kys3b.calibration.pilot_shards`), process them
+                   COMPLETE with production generation semantics, and write to
+                   `<setting>/_pilot/<pass>/`.  This is the calibration gate: full shards, real
+                   yield, bounded to a recorded shard set, and trivially discardable if the
+                   pilot says something must change.  `--pilot-to-production` instead writes to
+                   the production path, so the work counts as finished -- only use that once you
+                   have decided to keep it.
 """
 from __future__ import annotations
 
@@ -44,7 +53,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ..claims import ClaimDir
+from ..claims import ClaimDir, Heartbeat
 from ..config import PASSES, Config, env_offline
 from ..io import atomic_write_table, check, log, parquet_rows
 from ..prompts import (
@@ -151,14 +160,21 @@ def run(args) -> int:
 
     smoke_rows = getattr(args, "smoke_rows", None)
     max_shards = getattr(args, "max_shards", None)
+    pilot_k = getattr(args, "pilot", None)
+    pilot_to_prod = bool(getattr(args, "pilot_to_production", False))
+    check(
+        not (smoke_rows and pilot_k),
+        "--smoke-rows and --pilot are different gates; run them separately",
+    )
     src_dir = cfg.stage("sources") / setting
     prod_dir = cfg.stage("rewritten") / setting / spec["out_subdir"]
     # In --smoke-rows mode the shard is PARTIAL, so it must never land on the production path.
-    out_dir = (
-        cfg.stage("rewritten") / setting / "_smoke" / spec["out_subdir"]
-        if smoke_rows
-        else prod_dir
-    )
+    if smoke_rows:
+        out_dir = cfg.stage("rewritten") / setting / "_smoke" / spec["out_subdir"]
+    elif pilot_k and not pilot_to_prod:
+        out_dir = cfg.stage("rewritten") / setting / "_pilot" / spec["out_subdir"]
+    else:
+        out_dir = prod_dir
     # Raw-source guarantee (the 1.5B 09_Distill assertion): never read an output dir.
     check(
         cfg.stage("rewritten") not in src_dir.parents and src_dir.name != "p1",
@@ -172,18 +188,33 @@ def run(args) -> int:
 
     index = load_index(src_dir)
     n_shards = int(index["n_shards"])
+    claim_kind = "_claims_pilot" if (pilot_k and not pilot_to_prod) else "_claims"
     claims = ClaimDir(
-        cfg.stage("rewritten") / setting / "_claims" / spec["out_subdir"],
-        stale_seconds=int(cfg.budgets["sharding"]["claim_stale_seconds"]),
+        cfg.stage("rewritten") / setting / claim_kind / spec["out_subdir"],
+        stale_seconds=cfg.claim_stale_seconds,
     )
+    hb_interval = cfg.heartbeat_seconds
+
+    if pilot_k:
+        from ..calibration import pilot_shards as _pilot_shards
+
+        shard_universe = _pilot_shards(n_shards, int(pilot_k))
+        check(bool(shard_universe), f"--pilot {pilot_k} selected no shards")
+    else:
+        shard_universe = list(range(n_shards))
+
+    # The pilot writes complete, row-exact shards; judging completion on its OWN output makes a
+    # rerun idempotent and stops two pilot workers duplicating a shard.  A smoke run is partial,
+    # so completion is always judged on the production output there.
+    done_dir = out_dir if (pilot_k and not pilot_to_prod) else prod_dir
 
     def done(s: int) -> bool:
-        """Completion is always judged on the PRODUCTION output, never the smoke output.
+        """Completion is judged on full-row output only.
 
-        A full-row production shard is finished work; a partial smoke shard is not, and must not
-        make production skip it.
+        A full-row shard is finished work; a partial smoke shard is not, and must not make
+        production skip it.
         """
-        p = shard_path(prod_dir, s)
+        p = shard_path(done_dir, s)
         if not p.exists():
             return False
         try:
@@ -191,11 +222,17 @@ def run(args) -> int:
         except Exception:
             return False
 
-    todo_now = [s for s in range(n_shards) if not done(s)]
+    todo_now = [s for s in shard_universe if not done(s)]
     log(
         f"{setting}/{args.pass_name}: {n_shards} shards, {n_shards-len(todo_now)} already done, "
         f"{len(todo_now)} outstanding"
     )
+    if pilot_k:
+        log(
+            f"PILOT MODE: {len(shard_universe)} of {n_shards} shards, evenly spread: "
+            f"{shard_universe} -> output {out_dir}"
+            + ("  (PRODUCTION path)" if pilot_to_prod else "  (dedicated pilot path)")
+        )
     if max_shards is not None or smoke_rows is not None:
         log(
             f"SMOKE MODE: max_shards={max_shards} smoke_rows={smoke_rows} "
@@ -233,125 +270,153 @@ def run(args) -> int:
 
     prog_dir = cfg.stage("rewritten") / setting / "_progress" / spec["out_subdir"]
     prog_dir.mkdir(parents=True, exist_ok=True)
-    wid = claims.identity()["worker"]
+    ident = claims.identity()
+    wid = ident["worker"]
+    # Globally unique across BOTH arrays: task id alone would let primary task 0 and scavenger
+    # task 0 overwrite each other's progress JSON.
+    wkey = claims.worker_key()
     prog = dict(
         setting=setting, pass_name=args.pass_name, worker=wid,
+        worker_key=wkey, array_job=ident["array_job"], jobid=ident["jobid"],
+        host=ident["host"], pid=ident["pid"],
         shards_completed=0, docs_completed=0,
         docs_status_0=0, docs_status_1=0, docs_status_2=0,
         total_input_tokens=0, total_output_tokens=0, elapsed_seconds=0.0,
     )
     t0 = time.time()
-    since_monitor = 0
+    since_ref = [0]
     monitor_every = int(cfg.vllm["monitor_every"])
     monitor_file = cfg.stage("logs") / f"monitor_{setting}_{args.pass_name}.md"
 
-    for shard in claims.iter_available(range(n_shards), done, max_shards=max_shards):
+    for shard in claims.iter_available(shard_universe, done, max_shards=max_shards):
+        # The heartbeat covers the ENTIRE shard, not just llm.generate(): prompt templating,
+        # generation, llama-2 recounting and the parquet write are all blocking and all count
+        # against claim_stale_seconds.  The context manager always joins its thread, including
+        # when the body raises.
         try:
-            t = pq.read_table(shard_path(src_dir, shard), use_threads=False)
-            doc_ids = t.column("doc_id").to_numpy(zero_copy_only=False)
-            texts = t.column("text").to_pylist()
-            check(
-                len(texts) == int(index["shards"][shard]["rows"]),
-                f"shard {shard}: {len(texts)} rows != index {index['shards'][shard]['rows']}",
-            )
-            if smoke_rows:
-                # style assignment stays keyed on (42, shard_index) and is drawn for the FULL
-                # shard below, so the styles of the first N rows are the production ones
-                doc_ids = doc_ids[:smoke_rows]
-                texts = texts[:smoke_rows]
-            n_rows = len(texts)
-
-            if mode == "wrap":
-                # always draw the FULL shard so row i keeps its production style even in smoke mode
-                styles = assign_wrap_styles(
-                    shard, int(index["shards"][shard]["rows"]), cfg.seed
-                )[:n_rows]
-            else:
-                styles = [None] * n_rows
-
-            prompts, params, keep_pos, n_in_all = [], [], [], [0] * n_rows
-            status = [0] * n_rows
-            for j in range(n_rows):
-                content = build_content(mode, texts[j], template, wp, styles[j])
-                final = qtok.apply_chat_template(
-                    [{"role": chat["role"], "content": content}],
-                    add_generation_prompt=chat["add_generation_prompt"],
-                    tokenize=False,
+            with Heartbeat(claims, shard, hb_interval):
+                _process_shard(
+                    shard=shard, cfg=cfg, index=index, src_dir=src_dir, out_dir=out_dir,
+                    llm=llm, qtok=qtok, ltok=ltok, mode=mode, template=template, wp=wp,
+                    smp=smp, drop=drop, chat=chat, max_model_len=max_model_len,
+                    sampling_cls=SamplingParams,
+                    smoke_rows=smoke_rows, prog=prog, prog_dir=prog_dir, wkey=wkey,
+                    wid=wid, t0=t0, setting=setting, pass_name=args.pass_name,
+                    monitor_file=monitor_file, monitor_every=monitor_every,
+                    since=since_ref,
                 )
-                n_in = len(qtok(final, add_special_tokens=False).input_ids)
-                n_in_all[j] = n_in
-                if n_in > drop:
-                    continue  # status stays 0
-                max_new = min(int(smp["max_tokens"]), max_model_len - n_in)
-                prompts.append(final)
-                params.append(
-                    SamplingParams(
-                        temperature=smp["temperature"],
-                        top_p=smp["top_p"],
-                        max_tokens=max(1, max_new),
-                    )
-                )
-                keep_pos.append(j)
-
-            rewritten = [""] * n_rows
-            finish = [""] * n_rows
-            if prompts:
-                claims.heartbeat(shard)
-                outs = llm.generate(prompts, params)
-                for k, g in enumerate(outs):
-                    j = keep_pos[k]
-                    o = g.outputs[0]
-                    rewritten[j] = o.text
-                    finish[j] = o.finish_reason or ""
-                    status[j] = 1 if o.finish_reason == "length" else 2
-
-            rtok = count_batch(ltok, rewritten)
-            cols = {
-                "doc_id": pa.array(doc_ids, type=pa.int64()),
-                "rewritten": pa.array(rewritten, type=pa.large_string()),
-                "rewritten_tokens": pa.array(rtok, type=pa.int32()),
-                "status": pa.array(status, type=pa.int8()),
-                "finish_reason": pa.array(finish, type=pa.large_string()),
-                "input_tokens_qwen": pa.array(n_in_all, type=pa.int32()),
-            }
-            if mode == "wrap":
-                cols["wrap_style"] = pa.array(styles, type=pa.large_string())
-            atomic_write_table(pa.table(cols), shard_path(out_dir, shard))
-
-            prog["shards_completed"] += 1
-            prog["docs_completed"] += n_rows
-            prog["docs_status_0"] += status.count(0)
-            prog["docs_status_1"] += status.count(1)
-            prog["docs_status_2"] += status.count(2)
-            prog["total_input_tokens"] += int(sum(n_in_all[j] for j in keep_pos))
-            prog["total_output_tokens"] += int(sum(rtok))
-            prog["elapsed_seconds"] = round(time.time() - t0, 1)
-            (prog_dir / f"worker_{wid}.json").write_text(json.dumps(prog, indent=2))
-
-            since_monitor += n_rows
-            if since_monitor >= monitor_every:
-                since_monitor = 0
-                pick = list(range(0, n_rows, max(1, n_rows // 10)))[:10]
-                append_monitor(
-                    monitor_file, setting, args.pass_name, str(wid),
-                    [
-                        dict(
-                            doc_id=int(doc_ids[j]), status=status[j], src=texts[j] or "",
-                            out=rewritten[j], in_tokens=n_in_all[j], out_tokens=rtok[j],
-                        )
-                        for j in pick
-                    ],
-                )
-            log(
-                f"  shard {shard:05d} done: {n_rows} docs "
-                f"(s0={status.count(0)} s1={status.count(1)} s2={status.count(2)}) "
-                f"out_tok={sum(rtok):,}"
-            )
         finally:
             claims.release(shard)
 
-    log(f"worker {wid} finished: {prog['shards_completed']} shards in {prog['elapsed_seconds']}s")
+    log(f"worker {wkey} finished: {prog['shards_completed']} shards in {prog['elapsed_seconds']}s")
     return 0
+
+
+def _process_shard(
+    *, shard, cfg, index, src_dir, out_dir, llm, qtok, ltok, mode, template, wp, smp, drop,
+    chat, max_model_len, sampling_cls, smoke_rows, prog, prog_dir, wkey, wid, t0, setting,
+    pass_name, monitor_file, monitor_every, since,
+):
+    """Generate and write ONE shard.  Split out so the heartbeat wraps the whole unit of work."""
+    t = pq.read_table(shard_path(src_dir, shard), use_threads=False)
+    doc_ids = t.column("doc_id").to_numpy(zero_copy_only=False)
+    texts = t.column("text").to_pylist()
+    check(
+        len(texts) == int(index["shards"][shard]["rows"]),
+        f"shard {shard}: {len(texts)} rows != index {index['shards'][shard]['rows']}",
+    )
+    if smoke_rows:
+        # style assignment stays keyed on (42, shard_index) and is drawn for the FULL
+        # shard below, so the styles of the first N rows are the production ones
+        doc_ids = doc_ids[:smoke_rows]
+        texts = texts[:smoke_rows]
+    n_rows = len(texts)
+
+    if mode == "wrap":
+        # always draw the FULL shard so row i keeps its production style even in smoke mode
+        styles = assign_wrap_styles(
+            shard, int(index["shards"][shard]["rows"]), cfg.seed
+        )[:n_rows]
+    else:
+        styles = [None] * n_rows
+
+    prompts, params, keep_pos, n_in_all = [], [], [], [0] * n_rows
+    status = [0] * n_rows
+    for j in range(n_rows):
+        content = build_content(mode, texts[j], template, wp, styles[j])
+        final = qtok.apply_chat_template(
+            [{"role": chat["role"], "content": content}],
+            add_generation_prompt=chat["add_generation_prompt"],
+            tokenize=False,
+        )
+        n_in = len(qtok(final, add_special_tokens=False).input_ids)
+        n_in_all[j] = n_in
+        if n_in > drop:
+            continue  # status stays 0
+        max_new = min(int(smp["max_tokens"]), max_model_len - n_in)
+        prompts.append(final)
+        params.append(
+            sampling_cls(
+                temperature=smp["temperature"],
+                top_p=smp["top_p"],
+                max_tokens=max(1, max_new),
+            )
+        )
+        keep_pos.append(j)
+
+    rewritten = [""] * n_rows
+    finish = [""] * n_rows
+    if prompts:
+        outs = llm.generate(prompts, params)
+        for k, g in enumerate(outs):
+            j = keep_pos[k]
+            o = g.outputs[0]
+            rewritten[j] = o.text
+            finish[j] = o.finish_reason or ""
+            status[j] = 1 if o.finish_reason == "length" else 2
+
+    rtok = count_batch(ltok, rewritten)
+    cols = {
+        "doc_id": pa.array(doc_ids, type=pa.int64()),
+        "rewritten": pa.array(rewritten, type=pa.large_string()),
+        "rewritten_tokens": pa.array(rtok, type=pa.int32()),
+        "status": pa.array(status, type=pa.int8()),
+        "finish_reason": pa.array(finish, type=pa.large_string()),
+        "input_tokens_qwen": pa.array(n_in_all, type=pa.int32()),
+    }
+    if mode == "wrap":
+        cols["wrap_style"] = pa.array(styles, type=pa.large_string())
+    atomic_write_table(pa.table(cols), shard_path(out_dir, shard))
+
+    prog["shards_completed"] += 1
+    prog["docs_completed"] += n_rows
+    prog["docs_status_0"] += status.count(0)
+    prog["docs_status_1"] += status.count(1)
+    prog["docs_status_2"] += status.count(2)
+    prog["total_input_tokens"] += int(sum(n_in_all[j] for j in keep_pos))
+    prog["total_output_tokens"] += int(sum(rtok))
+    prog["elapsed_seconds"] = round(time.time() - t0, 1)
+    (prog_dir / f"worker_{wkey}.json").write_text(json.dumps(prog, indent=2))
+
+    since[0] += n_rows
+    if since[0] >= monitor_every:
+        since[0] = 0
+        pick = list(range(0, n_rows, max(1, n_rows // 10)))[:10]
+        append_monitor(
+            monitor_file, setting, pass_name, str(wid),
+            [
+                dict(
+                    doc_id=int(doc_ids[j]), status=status[j], src=texts[j] or "",
+                    out=rewritten[j], in_tokens=n_in_all[j], out_tokens=rtok[j],
+                )
+                for j in pick
+            ],
+        )
+    log(
+        f"  shard {shard:05d} done: {n_rows} docs "
+        f"(s0={status.count(0)} s1={status.count(1)} s2={status.count(2)}) "
+        f"out_tok={sum(rtok):,}"
+    )
 
 
 def _dry_run(cfg, args, setting, mode, template, wp, src_dir, index) -> int:
@@ -395,6 +460,15 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--max-shards", type=int, default=None,
         help="take at most N shards then exit cleanly; output is normal production work",
+    )
+    ap.add_argument(
+        "--pilot", type=int, default=None, metavar="K",
+        help="restrict to the K deterministic pilot shards spread across the whole range; "
+             "complete shards, production semantics, output to <setting>/_pilot/",
+    )
+    ap.add_argument(
+        "--pilot-to-production", action="store_true",
+        help="pilot writes to the production path (counts as finished work) instead of _pilot/",
     )
     ap.add_argument(
         "--smoke-rows", type=int, default=None,

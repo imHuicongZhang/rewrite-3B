@@ -109,6 +109,25 @@ production path, so a smoke run cannot make a later production job skip data. Th
 accepts `--max-shards N` on its own, which writes ordinary full-row production output that
 production correctly treats as finished work.
 
+### 3b. Calibration pilot -- the yield gate
+
+The 64-row smoke test proves the machinery works; it cannot tell you whether the rewritten-output
+yield clears 10B. QUALITY-FIRST is projected at only **+19.6%** headroom, so run real, complete
+shards first.
+
+```bash
+$E bin/pilot_launch.py                 # 12 COMPLETE shards per (setting, pass), spread evenly
+$E bin/pilot_launch.py --test-only     # validate (creates no job)
+$E bin/pilot_launch.py --submit        # run
+$E bin/pilot_report.py                 # exact r_census per pass, projected yield, headroom
+```
+
+Shards are the K mid-quantile indices of the shard range, **never the first K** -- source shards
+are contiguous slices of a doc_id-sorted selection, so a leading block is a systematically
+different slice of the corpus. Output goes to `<setting>/_pilot/<pass>/` so it is trivially
+discardable if the pilot says something must change; `--to-production` keeps it as finished work
+once you have decided. `pilot_report.py` exits non-zero if any arm projects under 5% headroom.
+
 ### 3. Rewriting -- both passes, all five arms
 
 ```bash
@@ -163,6 +182,14 @@ $E bin/validate.py --stage final
   visible half-written); stale reclaim is serialised by an `os.mkdir` guard, so a live claim is
   never moved and two workers can never both own a shard. Verified under 32 concurrent processes
   x 60 stampedes on WekaFS.
+* **Claims stay live while work is in flight.** A background thread refreshes the claim every
+  300 s for the whole shard -- templating, generation, recounting and the parquet write -- so a
+  slow shard cannot go stale under its owner. `heartbeat_seconds * 3 <= claim_stale_seconds` is a
+  config invariant; the thread is always joined, and it never touches a claim this process no
+  longer owns.
+* **No namespace collisions across the two arrays.** Cache, temp and progress paths include the
+  array job id as well as the task id, so primary task 0 and scavenger task 0 cannot share a
+  `TORCHINDUCTOR_CACHE_DIR` or overwrite each other's progress JSON.
 
 ## Decision 1, in one paragraph
 
