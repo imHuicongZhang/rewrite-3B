@@ -157,3 +157,34 @@ class TestCacheNamespace(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVllmIpcSocketPathFits(unittest.TestCase):
+    """vLLM binds ZMQ IPC sockets at $VLLM_RPC_BASE_PATH/<uuid4>; a Unix socket path is capped at
+    107 bytes.  The namespaced TMPDIR is too long for that (smoke jobs 915188-915192 died at engine
+    start), so _common.sh must point VLLM_RPC_BASE_PATH somewhere short."""
+
+    COMMON = Path(__file__).resolve().parents[1] / "slurm" / "_common.sh"
+    UUID_SUFFIX = 1 + 36  # "/" + str(uuid4())
+
+    def _rpc_base(self, job_id):
+        line = next(l for l in self.COMMON.read_text().splitlines()
+                    if l.startswith("export VLLM_RPC_BASE_PATH="))
+        out = subprocess.run(["bash", "-c", f'{line}; printf %s "$VLLM_RPC_BASE_PATH"'],
+                             env={"PATH": "/usr/bin:/bin", "SLURM_JOB_ID": str(job_id)},
+                             capture_output=True, text=True, check=True)
+        return out.stdout
+
+    def test_socket_path_fits_for_large_job_ids(self):
+        for job_id in (1, 915188, 9_999_999_999):
+            base = self._rpc_base(job_id)
+            self.assertIn(str(job_id), base, "must be per-job")
+            self.assertLessEqual(len(base) + self.UUID_SUFFIX, 107, base)
+
+    def test_namespaced_tmpdir_would_not_fit(self):
+        """Documents why TMPDIR cannot be the socket base for the GPU stages."""
+        tmp = "/weka/projects/bvandur1/zhuicon1/rewrite-3b/.cache/tmp/"
+        for ns in ("smoke/rewire-inspired/distill/915192/0",
+                   "rewrite/disagreement-aware/distill/1234567/31",
+                   "pilot/diversity-oriented/p1/1234567/11"):
+            self.assertGreater(len(tmp + ns) + self.UUID_SUFFIX, 107)

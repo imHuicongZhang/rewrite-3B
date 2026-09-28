@@ -35,6 +35,19 @@ export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 mkdir -p "$TMPDIR" "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" "$HF_HOME"
 
+# vLLM binds its ZMQ IPC sockets at $VLLM_RPC_BASE_PATH/<36-char uuid>, defaulting to TMPDIR.  A
+# Unix socket path is capped at 107 bytes, and the namespaced TMPDIR above already exceeds that
+# once the uuid is appended (all five smoke jobs 915188-915192 died at engine start with
+# "ipc path ... is longer than 107 characters").  Sockets only, so a short node-local per-job
+# directory is safe; TMPDIR and every cache stay namespaced as before.
+export VLLM_RPC_BASE_PATH="/tmp/kys3b_${SLURM_JOB_ID:-$$}"
+if (( ${#VLLM_RPC_BASE_PATH} + 37 > 107 )); then
+  echo "[slurm] VLLM_RPC_BASE_PATH '$VLLM_RPC_BASE_PATH' too long for a Unix socket path" >&2
+  exit 2
+fi
+mkdir -p "$VLLM_RPC_BASE_PATH"
+
 echo "[slurm] host=$(hostname) job=${SLURM_JOB_ID:-local} task=${SLURM_ARRAY_TASK_ID:-na} ns=$NS"
 echo "[slurm] cpus_per_task=${SLURM_CPUS_PER_TASK:-?} tres_per_task=${SLURM_TRES_PER_TASK:-none}"
 echo "[slurm] gpus=${CUDA_VISIBLE_DEVICES:-none} cpus=${SLURM_CPUS_PER_TASK:-?} restart=${SLURM_RESTART_COUNT:-0}"
+echo "[slurm] vllm_rpc_base_path=$VLLM_RPC_BASE_PATH"
