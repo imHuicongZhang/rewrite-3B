@@ -29,10 +29,13 @@ Bounded smoke mode.  Two independent limits, both absent in production:
                    shards stay unclaimed, and no shard is ever marked done without a full,
                    row-complete output.
 
-  --smoke-rows N   additionally process only the first N rows of the claimed shard AND divert
-                   the output to `<setting>/_smoke/<pass>/`, never the production path.  A
-                   partial shard therefore cannot be mistaken for finished work -- production
-                   still sees that shard as outstanding.  This is the truly tiny mode.
+  --smoke-rows N   additionally process only the first N rows of the claimed shard AND keep
+                   every piece of run state -- output, claims, progress, monitor, completion --
+                   under `<setting>/_smoke/` (see `run_paths`), never the production paths.  A
+                   partial shard therefore cannot be mistaken for finished work, production
+                   still sees that shard as outstanding, and production totals never include
+                   smoke tokens.  A finished smoke shard (N rows) is skipped by a later smoke
+                   run, which then takes the next shard.  This is the truly tiny mode.
 
   --pilot K        restrict this worker to the K deterministic pilot shards spread evenly across
                    the WHOLE shard range (`kys3b.calibration.pilot_shards`), process them
@@ -138,6 +141,47 @@ def append_monitor(monitor_file: Path, setting: str, pass_name: str, worker: str
         fcntl.flock(f, fcntl.LOCK_UN)
 
 
+# --------------------------------------------------------------------------- run state paths
+def run_paths(cfg, setting: str, pass_name: str, smoke_rows=None, pilot_k=None,
+              pilot_to_prod: bool = False) -> dict:
+    """Where one run's output, completion state, claims, progress and monitor file live.
+
+    Production (and --pilot-to-production) uses the production paths.  The pilot writes output
+    and claims under its own names.  A --smoke-rows run keeps ALL of its state under
+    `<setting>/_smoke/`, which no production reader (status, validate, calibrate, postprocess,
+    pilot_report) ever looks at, so a smoke run cannot change production resume or totals.
+    """
+    sub = PASS_SPEC[pass_name]["out_subdir"]
+    base = cfg.stage("rewritten") / setting
+    prod = dict(
+        out_dir=base / sub,
+        done_dir=base / sub,
+        claims_dir=base / "_claims" / sub,
+        prog_dir=base / "_progress" / sub,
+        monitor_file=cfg.stage("logs") / f"monitor_{setting}_{pass_name}.md",
+    )
+    if smoke_rows:
+        sm = base / "_smoke"
+        return dict(
+            out_dir=sm / sub,
+            done_dir=sm / sub,
+            claims_dir=sm / "_claims" / sub,
+            prog_dir=sm / "_progress" / sub,
+            monitor_file=cfg.stage("logs") / "smoke" / f"monitor_{setting}_{pass_name}.md",
+        )
+    if pilot_k and not pilot_to_prod:
+        # The pilot writes complete, row-exact shards; judging completion on its OWN output makes
+        # a rerun idempotent and stops two pilot workers duplicating a shard.
+        return dict(prod, out_dir=base / "_pilot" / sub, done_dir=base / "_pilot" / sub,
+                    claims_dir=base / "_claims_pilot" / sub)
+    return prod
+
+
+def expected_rows(shard_rows: int, smoke_rows=None) -> int:
+    """Rows a finished output shard must have: the full shard, or the smoke cap."""
+    return min(int(smoke_rows), int(shard_rows)) if smoke_rows else int(shard_rows)
+
+
 # --------------------------------------------------------------------------- worker
 def run(args) -> int:
     env_offline()
@@ -169,14 +213,8 @@ def run(args) -> int:
         "--smoke-rows and --pilot are different gates; run them separately",
     )
     src_dir = cfg.stage("sources") / setting
-    prod_dir = cfg.stage("rewritten") / setting / spec["out_subdir"]
-    # In --smoke-rows mode the shard is PARTIAL, so it must never land on the production path.
-    if smoke_rows:
-        out_dir = cfg.stage("rewritten") / setting / "_smoke" / spec["out_subdir"]
-    elif pilot_k and not pilot_to_prod:
-        out_dir = cfg.stage("rewritten") / setting / "_pilot" / spec["out_subdir"]
-    else:
-        out_dir = prod_dir
+    rp = run_paths(cfg, setting, args.pass_name, smoke_rows, pilot_k, pilot_to_prod)
+    out_dir = rp["out_dir"]
     # Raw-source guarantee (the 1.5B 09_Distill assertion): never read an output dir.
     check(
         cfg.stage("rewritten") not in src_dir.parents and src_dir.name != "p1",
@@ -190,11 +228,7 @@ def run(args) -> int:
 
     index = load_index(src_dir)
     n_shards = int(index["n_shards"])
-    claim_kind = "_claims_pilot" if (pilot_k and not pilot_to_prod) else "_claims"
-    claims = ClaimDir(
-        cfg.stage("rewritten") / setting / claim_kind / spec["out_subdir"],
-        stale_seconds=cfg.claim_stale_seconds,
-    )
+    claims = ClaimDir(rp["claims_dir"], stale_seconds=cfg.claim_stale_seconds)
     hb_interval = cfg.heartbeat_seconds
 
     if pilot_k:
@@ -205,22 +239,19 @@ def run(args) -> int:
     else:
         shard_universe = list(range(n_shards))
 
-    # The pilot writes complete, row-exact shards; judging completion on its OWN output makes a
-    # rerun idempotent and stops two pilot workers duplicating a shard.  A smoke run is partial,
-    # so completion is always judged on the production output there.
-    done_dir = out_dir if (pilot_k and not pilot_to_prod) else prod_dir
+    done_dir = rp["done_dir"]
 
     def done(s: int) -> bool:
-        """Completion is judged on full-row output only.
+        """Completion is judged on row-exact output in this run's own done_dir.
 
-        A full-row shard is finished work; a partial smoke shard is not, and must not make
-        production skip it.
+        Production and the pilot require the full shard.  A smoke run is judged only against its
+        own `_smoke/` output and its own row cap, so it never reads or marks production state.
         """
         p = shard_path(done_dir, s)
         if not p.exists():
             return False
         try:
-            return parquet_rows(p) == int(index["shards"][s]["rows"])
+            return parquet_rows(p) == expected_rows(int(index["shards"][s]["rows"]), smoke_rows)
         except Exception:
             return False
 
@@ -270,7 +301,7 @@ def run(args) -> int:
     chat = cfg.vllm["chat"]
     log(f"engine up: {ek}; sampling {smp}; input_drop {drop}")
 
-    prog_dir = cfg.stage("rewritten") / setting / "_progress" / spec["out_subdir"]
+    prog_dir = rp["prog_dir"]
     prog_dir.mkdir(parents=True, exist_ok=True)
     ident = claims.identity()
     wid = ident["worker"]
@@ -288,7 +319,7 @@ def run(args) -> int:
     t0 = time.time()
     since_ref = [0]
     monitor_every = int(cfg.vllm["monitor_every"])
-    monitor_file = cfg.stage("logs") / f"monitor_{setting}_{args.pass_name}.md"
+    monitor_file = rp["monitor_file"]
 
     for shard in claims.iter_available(shard_universe, done, max_shards=max_shards):
         # The heartbeat covers the ENTIRE shard, not just llm.generate(): prompt templating,

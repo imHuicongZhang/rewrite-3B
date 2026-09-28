@@ -93,7 +93,7 @@ class TestSmokeOutputIsolation(unittest.TestCase):
         )
 
     def _done(self, s):
-        """The worker's completion rule: judged on the PRODUCTION output only."""
+        """Production's completion rule: a full-row shard in the PRODUCTION output directory."""
         p = shard_path(self.prod, s)
         if not p.exists():
             return False
