@@ -58,6 +58,9 @@ class TestSmokeIsolationEndToEnd(unittest.TestCase):
         cfg0 = Config.load()
         if not (cfg0.model("qwen").exists() and cfg0.model("llama2").exists()):
             raise unittest.SkipTest("real tokenizers not available on this host")
+        # Import the tokenizer stack BEFORE any test patches sys.modules: patch.dict removes
+        # modules first imported inside it, and torch cannot be re-imported in one process.
+        from transformers import AutoTokenizer  # noqa: F401
 
     def setUp(self):
         self._d = tempfile.TemporaryDirectory()
@@ -147,6 +150,31 @@ class TestSmokeIsolationEndToEnd(unittest.TestCase):
         self.assertEqual(tok, prog[0]["total_output_tokens"],
                          "production total must equal production progress only")
 
+    def test_pilot_state_is_isolated_and_production_stays_outstanding(self):
+        ids = list(range(N_SHARDS))  # pilot_shards(3, 12) is every shard
+        for pass_name in ("p1", "distill"):
+            self._worker(pass_name, "--pilot", "12")
+            pl = self.base / "_pilot"
+            for k in ids:
+                self.assertEqual(parquet_rows(shard_path(pl / pass_name, k)), ROWS)
+            self.assertEqual(len(list((pl / "_progress" / pass_name).glob("worker_*.json"))), 1)
+            self.assertEqual(self._files(self.base / "_claims_pilot" / pass_name), [],
+                             "claim not released")
+            for prod in (self.base / pass_name, self.base / "_claims" / pass_name,
+                         self.base / "_progress" / pass_name):
+                self.assertEqual(self._files(prod), [], f"pilot wrote into {prod}")
+            self.assertFalse((self.cfg.stage("logs") / f"monitor_{SETTING}_{pass_name}.md")
+                             .exists(), "pilot wrote the production monitor file")
+            self.assertEqual(self._status(pass_name), (0, 0),
+                             "status must ignore pilot shards and tokens")
+
+        # a rerun of the pilot is a no-op; production still processes every shard
+        self._worker("p1", "--pilot", "12")
+        self.assertEqual(len(list((self.base / "_pilot" / "_progress" / "p1")
+                                  .glob("worker_*.json"))), 1)
+        self._worker("p1")
+        self.assertEqual(self._status("p1")[0], N_SHARDS)
+
     def test_production_and_pilot_paths_are_unchanged(self):
         b, logs = self.base, self.cfg.stage("logs")
         for pn in ("p1", "distill"):
@@ -156,8 +184,8 @@ class TestSmokeIsolationEndToEnd(unittest.TestCase):
                 monitor_file=logs / f"monitor_{SETTING}_{pn}.md"))
             self.assertEqual(worker.run_paths(self.cfg, SETTING, pn, pilot_k=12), dict(
                 out_dir=b / "_pilot" / pn, done_dir=b / "_pilot" / pn,
-                claims_dir=b / "_claims_pilot" / pn, prog_dir=b / "_progress" / pn,
-                monitor_file=logs / f"monitor_{SETTING}_{pn}.md"))
+                claims_dir=b / "_claims_pilot" / pn, prog_dir=b / "_pilot" / "_progress" / pn,
+                monitor_file=logs / "pilot" / f"monitor_{SETTING}_{pn}.md"))
             self.assertEqual(worker.run_paths(self.cfg, SETTING, pn, pilot_k=12,
                                               pilot_to_prod=True),
                              worker.run_paths(self.cfg, SETTING, pn))

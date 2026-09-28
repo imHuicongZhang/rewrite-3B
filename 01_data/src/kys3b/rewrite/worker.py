@@ -146,8 +146,8 @@ def run_paths(cfg, setting: str, pass_name: str, smoke_rows=None, pilot_k=None,
               pilot_to_prod: bool = False) -> dict:
     """Where one run's output, completion state, claims, progress and monitor file live.
 
-    Production (and --pilot-to-production) uses the production paths.  The pilot writes output
-    and claims under its own names.  A --smoke-rows run keeps ALL of its state under
+    Production (and --pilot-to-production) uses the production paths.  The pilot writes output,
+    claims, progress and its monitor under its own names.  A --smoke-rows run keeps ALL of its state under
     `<setting>/_smoke/`, which no production reader (status, validate, calibrate, postprocess,
     pilot_report) ever looks at, so a smoke run cannot change production resume or totals.
     """
@@ -171,9 +171,13 @@ def run_paths(cfg, setting: str, pass_name: str, smoke_rows=None, pilot_k=None,
         )
     if pilot_k and not pilot_to_prod:
         # The pilot writes complete, row-exact shards; judging completion on its OWN output makes
-        # a rerun idempotent and stops two pilot workers duplicating a shard.
-        return dict(prod, out_dir=base / "_pilot" / sub, done_dir=base / "_pilot" / sub,
-                    claims_dir=base / "_claims_pilot" / sub)
+        # a rerun idempotent and stops two pilot workers duplicating a shard.  Progress and the
+        # monitor are the pilot's own too: bin/status.py sums every JSON in the production
+        # `_progress/`, so pilot tokens there would inflate the production total.
+        return dict(out_dir=base / "_pilot" / sub, done_dir=base / "_pilot" / sub,
+                    claims_dir=base / "_claims_pilot" / sub,
+                    prog_dir=base / "_pilot" / "_progress" / sub,
+                    monitor_file=cfg.stage("logs") / "pilot" / f"monitor_{setting}_{pass_name}.md")
     return prod
 
 
