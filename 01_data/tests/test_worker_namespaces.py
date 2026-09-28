@@ -188,3 +188,33 @@ class TestVllmIpcSocketPathFits(unittest.TestCase):
                    "rewrite/disagreement-aware/distill/1234567/31",
                    "pilot/diversity-oriented/p1/1234567/11"):
             self.assertGreater(len(tmp + ns) + self.UUID_SUFFIX, 107)
+
+
+class TestFlashInferStaysOffHomeAndOffTheNodeToolkit(unittest.TestCase):
+    """Pilot jobs 915436/915437 died at engine start loading a FlashInfer sampling.so from $HOME
+    that another node had JIT-built against CUDA 12.  _common.sh must disable the FlashInfer
+    sampler (every request is greedy, so it only runs in warm-up) and keep its JIT cache per job
+    under the project cache."""
+
+    COMMON = Path(__file__).resolve().parents[1] / "slurm" / "_common.sh"
+
+    def _env(self, ns):
+        lines = [l for l in self.COMMON.read_text().splitlines()
+                 if l.startswith(("CODE=", "DATA=", "CACHE=", "NS=",
+                                  "export VLLM_USE_FLASHINFER_SAMPLER=",
+                                  "export FLASHINFER_WORKSPACE_BASE="))]
+        out = subprocess.run(
+            ["bash", "-c", "; ".join(lines)
+             + '; printf "%s|%s" "$VLLM_USE_FLASHINFER_SAMPLER" "$FLASHINFER_WORKSPACE_BASE"'],
+            env={"PATH": "/usr/bin:/bin", "HOME": "/home/someone", "KYS_NS": ns},
+            capture_output=True, text=True, check=True)
+        return out.stdout.split("|")
+
+    def test_sampler_disabled_and_workspace_namespaced(self):
+        a = self._env("pilot/wrap-inspired/p1/915436/0")
+        b = self._env("pilot/wrap-inspired/distill/915437/0")
+        self.assertEqual(a[0], "0")
+        self.assertFalse(a[1].startswith("/home"), a[1])
+        self.assertTrue(a[1].startswith("/weka/projects/bvandur1/zhuicon1/rewrite-3b/.cache/"), a[1])
+        self.assertIn("915436", a[1])
+        self.assertNotEqual(a[1], b[1])
