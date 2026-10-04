@@ -59,7 +59,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..claims import ClaimDir, Heartbeat
-from ..config import PASSES, Config, env_offline
+from ..config import PASSES, Config, env_offline, production_scope
 from ..io import atomic_write_table, check, log, parquet_rows
 from ..prompts import (
     assign_wrap_styles,
@@ -219,6 +219,16 @@ def run(args) -> int:
     src_dir = cfg.stage("sources") / setting
     rp = run_paths(cfg, setting, args.pass_name, smoke_rows, pilot_k, pilot_to_prod)
     out_dir = rp["out_dir"]
+    # Production scope (configs/production.yaml): output that lands on the PRODUCTION path is
+    # allowed only for in-scope settings.  Smoke and pilot outputs live elsewhere and are exempt.
+    if not args.dry_run and out_dir == cfg.stage("rewritten") / setting / spec["out_subdir"]:
+        scope = production_scope()
+        check(
+            setting in scope["allowed_settings"],
+            f"{setting} is excluded from production rewriting "
+            f"({scope['excluded_settings'].get(setting, 'not in allowed_settings')}); "
+            "see configs/production.yaml",
+        )
     # Raw-source guarantee (the 1.5B 09_Distill assertion): never read an output dir.
     check(
         cfg.stage("rewritten") not in src_dir.parents and src_dir.name != "p1",

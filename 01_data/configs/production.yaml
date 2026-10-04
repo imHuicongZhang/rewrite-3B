@@ -1,0 +1,26 @@
+# configs/production.yaml -- which settings production rewriting may generate.
+#
+# Scope decision, 2026-10-04 (user): the 3B experiment no longer needs new rewriting for
+# wrap-inspired or rewire-inspired.  Production generation is authorized ONLY for the three
+# settings below.  This supersedes plan.md section 15.3's "10 arrays, 5 settings x 2 passes".
+#
+# Enforced at every production entry point, fail-closed:
+#   bin/03_rewrite_launch.py      builds the worklist from `allowed_settings`; refuses anything else
+#   slurm/rewrite_array.sbatch    re-checks every worklist item (covers scavenger --requeue)
+#   kys3b.rewrite.worker          refuses to write PRODUCTION output for a non-allowed setting
+# Smoke (_smoke/) and pilot (_pilot/) runs are not production output and are unaffected.
+#
+# The excluded settings are NOT completed.  Their materialized sources (02_sources), smoke and
+# pilot outputs, logs and reports are preserved untouched; they are simply out of the current
+# production scope.  Re-including one requires an explicit user decision and an edit here.
+
+allowed_settings:            # smallest first (the 1.5B order, plan.md 15.3)
+  - disagreement-aware
+  - quality-first
+  - diversity-oriented
+
+passes: [p1, distill]        # Decision 3: both passes over the full source set, unchanged
+
+excluded_settings:
+  wrap-inspired: "out of 3B production scope (user decision 2026-10-04); sources/pilot/smoke preserved"
+  rewire-inspired: "out of 3B production scope (user decision 2026-10-04); sources/pilot/smoke preserved"

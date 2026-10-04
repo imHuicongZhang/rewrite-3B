@@ -103,7 +103,7 @@ class TestCacheNamespace(unittest.TestCase):
 
     @staticmethod
     def _ns_expr():
-        m = re.search(r'^export KYS_NS="(rewrite/[^"]+)"$', SBATCH.read_text(), re.M)
+        m = re.search(r'^\s*export KYS_NS="(rewrite/[^"]+)"$', SBATCH.read_text(), re.M)
         assert m, "could not find the KYS_NS assignment in rewrite_array.sbatch"
         return m.group(1)
 

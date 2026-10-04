@@ -128,17 +128,26 @@ different slice of the corpus. Output goes to `<setting>/_pilot/<pass>/` so it i
 discardable if the pilot says something must change; `--to-production` keeps it as finished work
 once you have decided. `pilot_report.py` exits non-zero if any arm projects under 5% headroom.
 
-### 3. Rewriting -- both passes, all five arms
+### 3. Rewriting -- both passes, production scope only
+
+**Scope (2026-10-04):** `configs/production.yaml` allows only `disagreement-aware`,
+`quality-first` and `diversity-oriented`. `wrap-inspired` and `rewire-inspired` are excluded from
+new generation (their sources, smoke and pilot outputs are preserved); the launcher, the array
+script (including scavenger requeues) and the worker's production path all refuse them.
 
 ```bash
 bash scripts/00_setup_env.sh                  # one-off: the vLLM env
-$E bin/03_rewrite_launch.py                   # PRINTS the 10 sbatch lines, submits nothing
-$E bin/03_rewrite_launch.py --test-only       # validate them (creates no job)
-$E bin/03_rewrite_launch.py --queue both --submit     # actually queue
-$E bin/status.py                              # progress + claim state
+$E bin/03_rewrite_launch.py --queue both      # PRINTS the 2 sbatch lines (one array per queue)
+$E bin/03_rewrite_launch.py --queue both --test-only   # validate them (creates no job)
+$E bin/03_rewrite_launch.py --queue both --submit      # actually queue (clean checkout required)
+$E bin/status.py --settings disagreement-aware quality-first diversity-oriented
 $E bin/calibrate.py                           # EXACT measured r vs the 1.5B census
 $E bin/validate.py --stage rewritten
 ```
+
+Every array task walks the same ordered worklist of (setting, pass) items, twice, so a GPU moves
+on when one drains. Tasks refuse to run if the checkout has moved from the submitted commit;
+do not change the checkout while production tasks can still start or requeue.
 
 Both passes are **always** generated over the full source set (Decision 3).  For REWIRE this is
 not an optimization question: the fastText filter ranks pass-1 and distill *together*, and

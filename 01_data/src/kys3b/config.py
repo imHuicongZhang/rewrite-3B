@@ -45,6 +45,25 @@ def _load(name: str) -> dict:
     return yaml.safe_load(p.read_text())
 
 
+def production_scope() -> dict:
+    """The settings production rewriting may generate (configs/production.yaml), validated.
+
+    Fails closed: a missing file, an unknown setting, or overlap between allowed and excluded is a
+    stop, never a fallback to "all rewriting settings".
+    """
+    s = _load("production.yaml")
+    allowed = list(s.get("allowed_settings") or [])
+    excluded = dict(s.get("excluded_settings") or {})
+    passes = list(s.get("passes") or [])
+    check(bool(allowed), "production.yaml: allowed_settings is empty")
+    check(len(set(allowed)) == len(allowed), f"production.yaml: duplicate settings {allowed}")
+    for name in [*allowed, *excluded]:
+        check(name in REWRITE_SETTINGS, f"production.yaml: {name!r} is not a rewriting setting")
+    check(not set(allowed) & set(excluded), f"production.yaml: allowed and excluded overlap")
+    check(passes and all(p in PASSES for p in passes), f"production.yaml: bad passes {passes}")
+    return dict(allowed_settings=allowed, excluded_settings=excluded, passes=passes)
+
+
 @dataclass
 class Config:
     budgets: dict

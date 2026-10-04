@@ -11,18 +11,23 @@ gpu:
   cpus_per_task: 16              # DefCpuPerGPU=30; 16 -> 187.5G at DefMemPerCPU=12000
   time: "3-00:00:00"             # partition maximum
   queues:
-    # jhu2 ALLOWS UP TO 32 concurrent GPUs for this user.  It does NOT guarantee them:
-    # actual availability depends on queue contention and scheduler allocation.
+    # Measured 2026-10-04 (sacctmgr): QOS jhu2 has MaxTRESPerUser = gres/gpu=32 AND
+    # MaxTRESPerAccount = gres/gpu=32, so the 32 is shared with every jhu2 user of
+    # bvandur1_blabscify.  Slurm enforces it (excess tasks pend QOSMaxGRES*); %32 just matches it.
+    # A ceiling, not a guarantee.
     primary:
       account: bvandur1_blabscify
       qos: jhu2
       array: "0-31%32"
       requeue: false
-    # scavenger adds PREEMPTIBLE capacity with no stated ceiling and no promise.
+    # scavenger: PREEMPTIBLE, no QOS/association GPU ceiling.  %96 ~= the usable H100+H200 fleet
+    # (152 installed, ~132 not drained/reserved) beyond the 32 jhu2 GPUs -- enough to absorb any
+    # capacity that frees up, without unbounded pending tasks.  Every task walks the whole
+    # worklist, so none is stranded on a drained (setting, pass).
     opportunistic:
       account: bvandur1
       qos: scavenger
-      array: "0-63%64"
+      array: "0-95%96"
       requeue: true
 
 cpu:
